@@ -27,7 +27,7 @@ down:
 # ── Headless pipeline run ────────────────────────────────────────────────────
 run:
 	docker compose exec fenics-pipeline papermill \
-		/workspace/pipeline_full.ipynb \
+		/workspace/notebooks/pipeline_full.ipynb \
 		/workspace/outputs/executed_nbs/pipeline_full_$(shell date +%Y%m%d_%H%M%S).ipynb \
 		--kernel fenics-pipeline
 

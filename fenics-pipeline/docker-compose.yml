@@ -17,7 +17,7 @@ services:
     volumes:
       # notebooks/ and src/ land at /workspace — Jupyter serves from here
       - type: bind
-        source: ${NOTEBOOK_DIR:-./notebooks}
+        source: ${NOTEBOOK_DIR:-.}
         target: /workspace
       # outputs/ — meshes, STLs, reports, executed_nbs all written here
       - type: bind

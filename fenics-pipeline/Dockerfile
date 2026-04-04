@@ -56,6 +56,7 @@ RUN source /usr/local/bin/dolfinx-env.sh && \
         scipy \
         tqdm \
         h5py && \
+        meshio \
     # Register kernel so pipeline_full.ipynb can find it via Papermill
     python -m ipykernel install --user --name "fenics-pipeline" --display-name "FEniCSx Pipeline"
 
