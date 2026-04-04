@@ -1,0 +1,34 @@
+# Pipeline outputs
+outputs/
+
+# Mesh artifacts
+*.msh
+*.xdmf
+*.h5
+*.stl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+
+# Test case outputs
+test_cases/*/outputs/
+test_cases/_previews/
+
+# Logs
+outputs/logs/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db

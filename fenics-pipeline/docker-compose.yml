@@ -1,0 +1,62 @@
+version: "3.9"
+
+services:
+  fenics-pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        DOLFINX_VERSION: "0.8.0"
+    image: fenics-pipeline:0.8.0
+    container_name: fenics-pipeline
+
+    ports:
+      - "8888:8888"   # JupyterLab UI — open notebooks/ here
+      - "8889:8889"   # spare
+
+    volumes:
+      # notebooks/ and src/ land at /workspace — Jupyter serves from here
+      - type: bind
+        source: ${NOTEBOOK_DIR:-./notebooks}
+        target: /workspace
+      # outputs/ — meshes, STLs, reports, executed_nbs all written here
+      - type: bind
+        source: ${OUTPUT_DIR:-./outputs}
+        target: /workspace/outputs
+      # Persistent pip cache — survives rebuilds
+      - pip-cache:/root/.cache/pip
+
+    environment:
+      # Must match --name flag in: python -m ipykernel install --name "fenics-pipeline"
+      # Papermill reads this when executing pipeline_full.ipynb
+      PAPERMILL_KERNEL: "fenics-pipeline"
+      OMPI_ALLOW_RUN_AS_ROOT: "1"
+      OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      PYVISTA_OFF_SCREEN: "true"
+      PYTHONFAULTHANDLER: "1"   # surfaced segfaults in 03_fea_fenicsx.ipynb
+
+    deploy:
+      resources:
+        limits:
+          cpus: "8"
+          memory: 16G
+        reservations:
+          memory: 4G
+
+    # MPI inter-process comms use /dev/shm — default 64MB kills parallel FEA
+    # Increase if 03_fea_fenicsx.ipynb hangs or OOMs on larger meshes
+    shm_size: "2gb"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    restart: unless-stopped
+
+volumes:
+  pip-cache:
+    driver: local
