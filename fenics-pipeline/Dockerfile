@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir \
         pyvista==0.43.10 \
         trimesh==4.4.0 \
         networkx \
-        scikit-image==0.22.0 \
+        scikit-image==0.24.0 \
         papermill==2.6.0 \
         ipykernel==6.29.5 \
         ipywidgets \
