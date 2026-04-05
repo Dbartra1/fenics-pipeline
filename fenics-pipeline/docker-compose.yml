@@ -6,8 +6,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        DOLFINX_VERSION: "0.8.0"
-    image: fenics-pipeline:0.8.0
+        DOLFINX_VERSION: "v0.9.0"
+    image: fenics-pipeline:v0.9.0
     container_name: fenics-pipeline
 
     ports:
