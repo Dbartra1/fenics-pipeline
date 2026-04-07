@@ -35,39 +35,41 @@ def compute_element_centroids(
 def build_filter_matrix(
     centroids: np.ndarray,
     filter_radius: float,
-    chunk_size: int = 2000,
+    chunk_size: int = 500,
 ) -> csr_matrix:
     """
-    Build the sparse filter weight matrix H where H[e, f] = max(0, r - d(e,f)).
-
-    Uses chunked distance computation to avoid O(n²) memory on large meshes.
-    For n=100k elements this matrix is ~100k x 100k but very sparse at
-    typical filter radii — expect < 0.1% fill.
-
-    chunk_size: number of elements to process per batch.
-                Reduce if hitting memory limits during filter construction.
+    filter_radius is in mm. Centroids are expected in metres.
+    Converts filter_radius to metres internally.
     """
+    from scipy.spatial import cKDTree
+    from scipy.sparse import csr_matrix as csr
+    import numpy as np
+
+    filter_radius_m = filter_radius / 1000.0  # mm → m
     n = len(centroids)
-    H = lil_matrix((n, n), dtype=np.float64)
+    tree = cKDTree(centroids)
+    pairs = tree.query_pairs(filter_radius_m, output_type='ndarray')
+    print(f"    KD-tree: {len(pairs):,} pairs found")
 
-    for start in range(0, n, chunk_size):
-        end = min(start + chunk_size, n)
-        chunk = centroids[start:end]  # (chunk, 3)
+    if len(pairs) > 0:
+        i_idx = pairs[:, 0]
+        j_idx = pairs[:, 1]
+        dists = np.linalg.norm(centroids[i_idx] - centroids[j_idx], axis=1)
+        weights = np.maximum(0.0, filter_radius_m - dists)
 
-        # Pairwise distances: chunk vs all centroids
-        diff = centroids[np.newaxis, :, :] - chunk[:, np.newaxis, :]  # (chunk, n, 3)
-        dist = np.linalg.norm(diff, axis=2)  # (chunk, n)
+        # Build COO arrays directly — no Python loop needed
+        rows = np.concatenate([i_idx, j_idx, np.arange(n)])
+        cols = np.concatenate([j_idx, i_idx, np.arange(n)])
+        data = np.concatenate([weights, weights,
+                                np.full(n, filter_radius_m)])
+    else:
+        rows = np.arange(n)
+        cols = np.arange(n)
+        data = np.full(n, filter_radius_m)
 
-        weights = np.maximum(0.0, filter_radius - dist)  # (chunk, n)
-
-        for local_i, global_i in enumerate(range(start, end)):
-            nonzero = np.where(weights[local_i] > 0)[0]
-            H[global_i, nonzero] = weights[local_i, nonzero]
-
-    H_csr = H.tocsr()
-
-    # Row sums for normalization — precompute once
-    return H_csr
+    from scipy.sparse import coo_matrix
+    H = coo_matrix((data, (rows, cols)), shape=(n, n))
+    return H.tocsr()
 
 
 def apply_filter(
