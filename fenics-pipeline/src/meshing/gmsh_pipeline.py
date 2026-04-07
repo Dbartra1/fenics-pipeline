@@ -76,9 +76,9 @@ def import_and_repair_stl(
     angle_rad = angle_deg * 3.14159 / 180
     gmsh.model.mesh.classifySurfaces(
         angle_rad,
-        includeBoundary=True,
-        forReparametrization=False,
-        curveAngleTolerance=angle_rad / 2,
+        True,
+        False,
+        angle_rad / 2,
     )
 
     # Create a geometric surface from the classified mesh
@@ -206,69 +206,62 @@ def export_mesh(
 ) -> tuple[Path, Path]:
     """
     Export to .msh (gmsh native) and .xdmf/.h5 (FEniCSx native).
-
-    .msh  — kept for debugging and re-meshing without re-running OpenSCAD
-    .xdmf — what 03_fea_fenicsx.ipynb actually reads
-
-    Returns (msh_path, xdmf_path).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-
     msh_path = output_dir / f"{part_name}.msh"
     gmsh.write(str(msh_path))
 
-    # Convert to XDMF via meshio — FEniCSx reads XDMF natively
-    # meshio is bundled with FEniCSx in the dolfinx image
     try:
         import meshio
+        import numpy as np
         msh = meshio.read(str(msh_path))
 
-        # Extract tetrahedral cells (volume) and triangular cells (boundaries)
-        # meshio uses "tetra" for linear tets, "tetra10" for quadratic
-        tet_cells = None
-        tri_cells = None
-        for cell_block in msh.cells:
-            if cell_block.type == "tetra" and tet_cells is None:
-                tet_cells = cell_block
-            if cell_block.type == "triangle" and tri_cells is None:
-                tri_cells = cell_block
+        phys = msh.cell_data_dict.get("gmsh:physical", {})
 
-        if tet_cells is None:
-            raise ValueError("No tetrahedral cells found in mesh — "
-                             "volume meshing may have failed silently")
+        # Collect ALL triangle blocks and concatenate — gmsh writes one block
+        # per surface, meshio merges the data but keeps blocks separate
+        tri_blocks = [b.data for b in msh.cells if b.type == "triangle"]
+        tet_blocks = [b.data for b in msh.cells if b.type == "tetra"]
+
+        if not tet_blocks:
+            raise ValueError("No tetrahedral cells found in mesh")
+
+        tet_cells = np.vstack(tet_blocks)
+        tet_data  = phys.get("tetra")
 
         # Write volume mesh
         xdmf_path = output_dir / f"{part_name}.xdmf"
+        vol_data = {}
+        if tet_data is not None:
+            vol_data["gmsh:physical"] = [tet_data]
         meshio.write(
             str(xdmf_path),
             meshio.Mesh(
                 points=msh.points,
-                cells={"tetra": tet_cells.data},
-                cell_data={"gmsh:physical": [
-                    msh.cell_data_dict["gmsh:physical"].get("tetra",
-                    [None] * len(tet_cells.data))
-                ]},
+                cells={"tetra": tet_cells},
+                cell_data=vol_data,
             )
         )
 
-        # Write boundary mesh (triangles) — used by FEniCSx for BC application
-        if tri_cells is not None:
-            bnd_path = output_dir / f"{part_name}_boundaries.xdmf"
+        # Write boundary mesh — concatenate all triangle blocks
+        bnd_path = output_dir / f"{part_name}_boundaries.xdmf"
+        if tri_blocks:
+            tri_cells = np.vstack(tri_blocks)
+            tri_data  = phys.get("triangle")
+            bnd_data  = {}
+            if tri_data is not None:
+                bnd_data["gmsh:physical"] = [tri_data]
             meshio.write(
                 str(bnd_path),
                 meshio.Mesh(
                     points=msh.points,
-                    cells={"triangle": tri_cells.data},
-                    cell_data={"gmsh:physical": [
-                        msh.cell_data_dict["gmsh:physical"].get("triangle",
-                        [None] * len(tri_cells.data))
-                    ]},
+                    cells={"triangle": tri_cells},
+                    cell_data=bnd_data,
                 )
             )
 
     except ImportError:
-        raise RuntimeError("meshio not found — it should be bundled with dolfinx. "
-                           "Check the Dockerfile pip install block.")
+        raise RuntimeError("meshio not found")
 
     return msh_path, xdmf_path
 
