@@ -1,0 +1,25 @@
+{
+  "_comment": "Paired with low VOLUME_FRACTION in pipeline \u2014 set SIMP_OVERRIDES volume_fraction=0.2 in pipeline_full.ipynb. Tests whether SIMP converges cleanly at 20% material retention.",
+  "part_name": "aggressive_optimization",
+  "geometry": {
+    "length": 100.0,
+    "width": 60.0,
+    "height": 20.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 3.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 1000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/aggressive_optimization/outputs/meshes",
+    "stl_ascii": false
+  }
+}

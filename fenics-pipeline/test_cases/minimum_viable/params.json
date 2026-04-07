@@ -1,0 +1,25 @@
+{
+  "_comment": "Smallest reasonable part. Tests that the pipeline handles small geometry without gmsh producing degenerate elements.",
+  "part_name": "minimum_viable",
+  "geometry": {
+    "length": 30.0,
+    "width": 20.0,
+    "height": 10.0,
+    "wall_thickness": 2.0,
+    "fillet_radius": 1.0,
+    "mounting_hole_diameter": 3.0,
+    "mounting_hole_inset": 5.0
+  },
+  "mesh_hints": {
+    "target_element_size": 2.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 200.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/minimum_viable/outputs/meshes",
+    "stl_ascii": false
+  }
+}

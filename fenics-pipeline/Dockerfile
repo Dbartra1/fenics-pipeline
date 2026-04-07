@@ -51,7 +51,7 @@ ENV MESA_GL_VERSION_OVERRIDE=3.3
 
 WORKDIR /workspace
 
-RUN printf '#!/bin/bash\nexec "$@"\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+RUN printf '#!/bin/bash\nXvfb :99 -screen 0 1024x768x24 &\nsleep 1\nexec "$@"\n' > /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 

@@ -1,0 +1,25 @@
+{
+  "_comment": "Large part with coarse mesh. Tests that coordinate ranges don't cause numerical issues in FEniCSx.",
+  "part_name": "maximum_size",
+  "geometry": {
+    "length": 300.0,
+    "width": 200.0,
+    "height": 50.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 20.0
+  },
+  "mesh_hints": {
+    "target_element_size": 5.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 10000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/maximum_size/outputs/meshes",
+    "stl_ascii": false
+  }
+}

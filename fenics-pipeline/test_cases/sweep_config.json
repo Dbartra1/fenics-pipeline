@@ -1,0 +1,71 @@
+{
+  "_instructions": "Copy SWEEP_PARAMS into pipeline_full.ipynb Cell 0 and set SWEEP_MODE = True to run all cases.",
+  "SWEEP_MODE": true,
+  "SWEEP_PARAMS": [
+    {
+      "PART_NAME": "baseline",
+      "PARAMS_JSON": "test_cases/baseline/params.json"
+    },
+    {
+      "PART_NAME": "tall_narrow",
+      "PARAMS_JSON": "test_cases/tall_narrow/params.json"
+    },
+    {
+      "PART_NAME": "squat_wide",
+      "PARAMS_JSON": "test_cases/squat_wide/params.json"
+    },
+    {
+      "PART_NAME": "thin_wall",
+      "PARAMS_JSON": "test_cases/thin_wall/params.json"
+    },
+    {
+      "PART_NAME": "large_holes",
+      "PARAMS_JSON": "test_cases/large_holes/params.json"
+    },
+    {
+      "PART_NAME": "heavy_load",
+      "PARAMS_JSON": "test_cases/heavy_load/params.json"
+    },
+    {
+      "PART_NAME": "light_load",
+      "PARAMS_JSON": "test_cases/light_load/params.json"
+    },
+    {
+      "PART_NAME": "load_bottom",
+      "PARAMS_JSON": "test_cases/load_bottom/params.json"
+    },
+    {
+      "PART_NAME": "coarse_mesh",
+      "PARAMS_JSON": "test_cases/coarse_mesh/params.json"
+    },
+    {
+      "PART_NAME": "fine_mesh",
+      "PARAMS_JSON": "test_cases/fine_mesh/params.json"
+    },
+    {
+      "PART_NAME": "aggressive_optimization",
+      "PARAMS_JSON": "test_cases/aggressive_optimization/params.json"
+    },
+    {
+      "PART_NAME": "conservative_optimization",
+      "PARAMS_JSON": "test_cases/conservative_optimization/params.json"
+    },
+    {
+      "PART_NAME": "minimum_viable",
+      "PARAMS_JSON": "test_cases/minimum_viable/params.json"
+    },
+    {
+      "PART_NAME": "maximum_size",
+      "PARAMS_JSON": "test_cases/maximum_size/params.json"
+    }
+  ],
+  "MESH_OVERRIDES": {
+    "QUALITY_STRICT": false
+  },
+  "SIMP_OVERRIDES": {
+    "MAX_ITERATIONS": 50
+  },
+  "EXPORT_OVERRIDES": {
+    "VOXEL_RESOLUTION": 80
+  }
+}

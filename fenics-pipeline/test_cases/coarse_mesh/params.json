@@ -1,0 +1,25 @@
+{
+  "_comment": "Coarse mesh for rapid iteration and smoke testing. Lower quality but completes in minutes rather than hours. Use this when testing pipeline changes.",
+  "part_name": "coarse_mesh",
+  "geometry": {
+    "length": 100.0,
+    "width": 60.0,
+    "height": 20.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 5.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 1000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/coarse_mesh/outputs/meshes",
+    "stl_ascii": false
+  }
+}

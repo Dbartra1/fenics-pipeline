@@ -1,0 +1,25 @@
+{
+  "_comment": "High load \u2014 likely pushes safety factor below 1.5 warning threshold. Tests Stage 3 warning logic. May fail safety check.",
+  "part_name": "heavy_load",
+  "geometry": {
+    "length": 100.0,
+    "width": 60.0,
+    "height": 20.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 2.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 5000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/heavy_load/outputs/meshes",
+    "stl_ascii": false
+  }
+}

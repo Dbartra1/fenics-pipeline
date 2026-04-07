@@ -1,0 +1,25 @@
+{
+  "_comment": "Very low stress throughout. Tests SIMP when the optimizer has little signal \u2014 density field may not converge to a clean binary result.",
+  "part_name": "light_load",
+  "geometry": {
+    "length": 100.0,
+    "width": 60.0,
+    "height": 20.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 2.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 100.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/light_load/outputs/meshes",
+    "stl_ascii": false
+  }
+}

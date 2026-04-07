@@ -1,0 +1,25 @@
+{
+  "_comment": "High aspect ratio geometry \u2014 tests surface classification in gmsh. Top/bottom tags are far apart in Z.",
+  "part_name": "tall_narrow",
+  "geometry": {
+    "length": 60.0,
+    "width": 40.0,
+    "height": 50.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 2.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 1000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/tall_narrow/outputs/meshes",
+    "stl_ascii": false
+  }
+}

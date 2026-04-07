@@ -1,0 +1,25 @@
+{
+  "_comment": "Low height \u2014 nearly 2D. Tests whether gmsh classifies top/bottom correctly when they are close in Z.",
+  "part_name": "squat_wide",
+  "geometry": {
+    "length": 150.0,
+    "width": 100.0,
+    "height": 10.0,
+    "wall_thickness": 4.0,
+    "fillet_radius": 2.0,
+    "mounting_hole_diameter": 6.0,
+    "mounting_hole_inset": 10.0
+  },
+  "mesh_hints": {
+    "target_element_size": 2.0,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "top",
+    "load_magnitude_n": 1000.0
+  },
+  "export": {
+    "stl_output_dir": "test_cases/squat_wide/outputs/meshes",
+    "stl_ascii": false
+  }
+}
