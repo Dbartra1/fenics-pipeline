@@ -16,7 +16,7 @@
   },
   "load_hints": {
     "primary_face": "top",
-    "load_magnitude_n": 1000.0
+    "load_magnitude_n": 13000.0
   },
   "export": {
     "stl_output_dir": "outputs/meshes",

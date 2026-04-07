@@ -192,13 +192,14 @@ def _oc_update(
     move: float,
     rho_min: float,
 ) -> np.ndarray:
-    """
-    Optimality Criteria density update via bisection on Lagrange multiplier.
-    """
     total_vol  = elem_vols.sum()
     target_vol = volume_fraction * total_vol
 
-    l1, l2 = 1e-9, 1e9
+    l1, l2 = 1e-6, 1e6
+
+    lmid = 0.5 * (l1 + l2)
+    test = rho * np.sqrt(np.maximum(0.0, -dc) / (lmid * elem_vols + 1e-16))
+    print(f"    OC debug: test rho [{test.min():.3f}, {test.max():.3f}] at lmid={lmid:.3e}")
 
     for _ in range(200):
         lmid    = 0.5 * (l1 + l2)
@@ -216,6 +217,7 @@ def _oc_update(
         if l2 - l1 < 1e-12 * (l1 + l2):
             break
 
+    print(f"    OC debug: final lmid={lmid:.3e}, rho_new [{rho_new.min():.3f}, {rho_new.max():.3f}]")
     return rho_new
 
 
@@ -266,7 +268,8 @@ def run_simp(
               f"({100*H.nnz/n_elem**2:.3f}% fill)")
 
         # ── Initialize density field ──────────────────────────────────────
-        rho = np.full(n_elem, config.volume_fraction, dtype=np.float64)
+        # Start fully solid — OC removes material over iterations
+        rho = np.ones(n_elem, dtype=np.float64)
 
         converged  = False
         rho_change = np.inf
@@ -300,11 +303,17 @@ def run_simp(
             dc_raw = -config.penal * rho_filtered**(config.penal - 1) * strain_energies
             dc     = (H.T @ (dc_raw / (Hs + 1e-16)))
 
+            # Normalize to [-1, 0] range so OC bisection works regardless
+            # of unit system or load magnitude
+            dc = dc / (np.abs(dc).max() + 1e-16)
+
+
             # Step 5: OC density update
             rho = _oc_update(
                 rho, dc, elem_vols,
                 config.volume_fraction, config.move, config.rho_min
             )
+            
 
             # Step 6: convergence check
             rho_change = np.max(np.abs(rho - rho_old))
