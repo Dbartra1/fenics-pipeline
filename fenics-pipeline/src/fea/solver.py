@@ -63,8 +63,7 @@ def _build_function_space(domain: dolfinx.mesh.Mesh) -> fem.FunctionSpace:
     CG2 would give better stress accuracy but 8x more DOFs — not worth it
     for the SIMP stage which operates on element-averaged quantities anyway.
     """
-    elem = ufl.VectorElement("CG", domain.ufl_cell(), degree=1)
-    return fem.FunctionSpace(domain, elem)
+    return fem.functionspace(domain, ("CG", 1, (domain.geometry.dim,)))
 
 
 def _build_weak_form(
@@ -139,7 +138,7 @@ def _compute_von_mises(
     von_mises_expr = ufl.sqrt(3/2 * ufl.inner(s, s))
 
     # DG0 function space — piecewise constant per element
-    W   = fem.FunctionSpace(domain, ("DG", 0))
+    W   = fem.functionspace(domain, ("DG", 0))
     vm  = fem.Function(W, name="von_mises")
     vm_expr = fem.Expression(von_mises_expr, W.element.interpolation_points())
     vm.interpolate(vm_expr)
@@ -185,6 +184,11 @@ def run_fea(
             domain.topology.create_connectivity(
                 domain.topology.dim - 1, domain.topology.dim
             )
+
+        # Convert mesh coordinates from mm to m — gmsh outputs in mm,
+        # FEniCSx assumes SI units (metres) throughout
+        
+        domain.geometry.x[:] /= 1000.0
 
         # ── Load boundary tags ──────────────────────────────────────────────
         from src.fea.boundary_conditions import (

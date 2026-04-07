@@ -80,23 +80,20 @@ def _load_mesh_and_bcs(
     load_hints: dict,
     material: dict,
 ) -> tuple:
-    """
-    Load mesh, BCs, and material constants.
-    Called once before the optimization loop — mesh stays fixed throughout.
-    Returns (domain, V, bc_set, lam, mu, dx, element_volumes, centroids, tets)
-    """
     comm = MPI.COMM_WORLD
-
     with XDMFFile(comm, str(xdmf_path), "r") as xdmf:
         domain = xdmf.read_mesh(name="Grid")
         domain.topology.create_connectivity(
             domain.topology.dim - 1, domain.topology.dim
         )
 
+    # Convert mm → m — gmsh outputs in mm, FEniCSx assumes SI (metres)
+    domain.geometry.x[:] /= 1000.0
+
     facet_tags = load_boundary_mesh(str(boundaries_xdmf), domain)
 
-    # Vector CG1 for displacement
-    V      = fem.FunctionSpace(domain, ufl.VectorElement("CG", domain.ufl_cell(), 1))
+    # Vector CG1 for displacement — v0.9.0 API
+    V      = fem.functionspace(domain, ("CG", 1, (domain.geometry.dim,)))
     bc_set = build_boundary_conditions(V, domain, facet_tags, load_hints)
 
     E  = material["youngs_modulus_pa"]
@@ -108,18 +105,14 @@ def _load_mesh_and_bcs(
 
     dx = ufl.Measure("dx", domain=domain)
 
-    # Element volumes — needed for volume fraction constraint
-    # Integrate constant 1 over each cell using DG0
-    W     = fem.FunctionSpace(domain, ("DG", 0))
+    W     = fem.functionspace(domain, ("DG", 0))
     v_one = fem.Function(W)
     v_one.x.array[:] = 1.0
     vol_form = fem.form(v_one * dx)
-    # Per-element volume via local assembly
     n_elem   = W.dofmap.index_map.size_local
     elem_vols = np.ones(n_elem) * (domain.comm.allreduce(
         fem.assemble_scalar(vol_form), op=MPI.SUM) / n_elem)
 
-    # Element centroids and connectivity for filter
     points = domain.geometry.x
     tdim   = domain.topology.dim
     domain.topology.create_connectivity(tdim, 0)
@@ -129,11 +122,10 @@ def _load_mesh_and_bcs(
 
     return domain, V, bc_set, lam, mu, dx, elem_vols, centroids, tets, W
 
-
 def _penalized_solve(
     domain, V, bc_set, lam, mu, dx,
     rho: np.ndarray,
-    W: fem.FunctionSpace,
+    W,
     penal: float,
     petsc_options: dict,
 ) -> tuple[fem.Function, np.ndarray]:
@@ -175,8 +167,6 @@ def _penalized_solve(
     u_sol = problem.solve()
 
     # Element strain energies (sensitivities)
-    # dc/drho_e = -penal * rho_e^(penal-1) * u_e^T K_e^0 u_e
-    # We compute the inner part: u_e^T K_e^0 u_e per element via DG0 projection
     strain_energy_expr = ufl.inner(sigma0(u_sol), eps(u_sol))
     se_fn  = fem.Function(W)
     se_expr = fem.Expression(strain_energy_expr, W.element.interpolation_points())
@@ -209,14 +199,12 @@ def _oc_update(
 
     for _ in range(200):
         lmid    = 0.5 * (l1 + l2)
-        # OC update formula
         rho_new = np.maximum(rho_min,
                   np.maximum(rho - move,
                   np.minimum(1.0,
                   np.minimum(rho + move,
                   rho * np.sqrt(np.maximum(0.0, -dc) / (lmid * elem_vols + 1e-16))
                   ))))
-        # Check volume constraint
         if (rho_new * elem_vols).sum() > target_vol:
             l1 = lmid
         else:
@@ -275,7 +263,6 @@ def run_simp(
         print(f"  Filter matrix: {H.nnz:,} nonzeros ({100*H.nnz/n_elem**2:.3f}% fill)")
 
         # ── Initialize density field ──────────────────────────────────────
-        # Uniform start at volume_fraction — feasible initial point
         rho = np.full(n_elem, config.volume_fraction, dtype=np.float64)
 
         converged  = False
@@ -283,8 +270,8 @@ def run_simp(
         comm       = MPI.COMM_WORLD
 
         # ── XDMF writer for density checkpoints ──────────────────────────
-        density_path     = output_dir / f"{part_name}_density.xdmf"
-        density_fn       = fem.Function(W, name="density")
+        density_path = output_dir / f"{part_name}_density.xdmf"
+        density_fn   = fem.Function(W, name="density")
 
         # ── Optimization loop ─────────────────────────────────────────────
         for iteration in range(1, config.max_iterations + 1):
@@ -310,7 +297,6 @@ def run_simp(
             compliance_history.append(compliance)
 
             # Step 4: sensitivities dc/drho_e
-            # Chain rule through filter: dc/drho = H^T (dc/drho_filtered) / Hs
             dc_raw  = -config.penal * rho_filtered**(config.penal - 1) * strain_energies
             Hs      = np.array(H.sum(axis=1)).ravel()
             dc      = (H.T @ (dc_raw / (Hs + 1e-16)))
