@@ -17,8 +17,7 @@
 
 from __future__ import annotations
 import time
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
 
@@ -45,29 +44,29 @@ from src.fea.boundary_conditions import (
 
 @dataclass
 class SIMPConfig:
-    volume_fraction:  float = 0.4    # target fraction of material to retain
-    penal:            float = 3.0    # penalization power — 3 is standard
-    filter_radius:    float = 6.0    # mm — set to 2-3x target_element_size
-    max_iterations:   int   = 100
-    convergence_tol:  float = 1e-3   # change in density field between iterations
-    rho_min:          float = 1e-3   # minimum density — never true void (avoid singularity)
-    move:             float = 0.2    # OC update move limit — max change per iteration
-    checkpoint_every: int   = 10     # save density XDMF every N iterations
-    safety_factor_min: float = 1.2   # abort if safety factor drops below this
+    volume_fraction:   float = 0.4
+    penal:             float = 3.0
+    filter_radius:     float = 6.0
+    max_iterations:    int   = 100
+    convergence_tol:   float = 1e-3
+    rho_min:           float = 1e-3
+    move:              float = 0.2
+    checkpoint_every:  int   = 10
+    safety_factor_min: float = 1.2
 
 
 @dataclass
 class SIMPResult:
-    success:           bool
-    density_path:      Optional[Path]
+    success:            bool
+    density_path:       Optional[Path]
     compliance_history: list[float]
-    volume_history:    list[float]
-    n_iterations:      int
-    converged:         bool
-    final_compliance:  Optional[float]
-    final_volume_frac: Optional[float]
-    duration_s:        float
-    error:             Optional[str]
+    volume_history:     list[float]
+    n_iterations:       int
+    converged:          bool
+    final_compliance:   Optional[float]
+    final_volume_frac:  Optional[float]
+    duration_s:         float
+    error:              Optional[str]
 
     def raise_if_failed(self) -> None:
         if not self.success:
@@ -80,7 +79,12 @@ def _load_mesh_and_bcs(
     load_hints: dict,
     material: dict,
 ) -> tuple:
+    """
+    Load mesh, BCs, and material constants.
+    Returns (domain, V, bc_set, lam, mu, dx, elem_vols, centroids, tets, W)
+    """
     comm = MPI.COMM_WORLD
+
     with XDMFFile(comm, str(xdmf_path), "r") as xdmf:
         domain = xdmf.read_mesh(name="Grid")
         domain.topology.create_connectivity(
@@ -105,22 +109,33 @@ def _load_mesh_and_bcs(
 
     dx = ufl.Measure("dx", domain=domain)
 
-    W     = fem.functionspace(domain, ("DG", 0))
-    v_one = fem.Function(W)
-    v_one.x.array[:] = 1.0
-    vol_form = fem.form(v_one * dx)
-    n_elem   = W.dofmap.index_map.size_local
-    elem_vols = np.ones(n_elem) * (domain.comm.allreduce(
-        fem.assemble_scalar(vol_form), op=MPI.SUM) / n_elem)
-
+    # Node coordinates — used for elem_vols and centroids
     points = domain.geometry.x
-    tdim   = domain.topology.dim
-    domain.topology.create_connectivity(tdim, 0)
-    conn   = domain.topology.connectivity(tdim, 0)
-    tets   = np.array([conn.links(i) for i in range(n_elem)])
+
+    # DG0 function space — one DOF per element
+    W      = fem.functionspace(domain, ("DG", 0))
+    n_elem = W.dofmap.index_map.size_local
+
+    # Per-element volumes via direct tet geometry (m³)
+    # More accurate than averaging total volume across all elements
+    domain.topology.create_connectivity(domain.topology.dim, 0)
+    conn_v       = domain.topology.connectivity(domain.topology.dim, 0)
+    tets_for_vol = np.array([conn_v.links(i) for i in range(n_elem)])
+    v0 = points[tets_for_vol[:, 0]]
+    v1 = points[tets_for_vol[:, 1]]
+    v2 = points[tets_for_vol[:, 2]]
+    v3 = points[tets_for_vol[:, 3]]
+    a_v = v1 - v0
+    b_v = v2 - v0
+    c_v = v3 - v0
+    elem_vols = np.abs(np.einsum('ij,ij->i', a_v, np.cross(b_v, c_v))) / 6.0
+
+    # Element centroids for density filter
+    tets      = tets_for_vol   # same connectivity, reuse
     centroids = compute_element_centroids(points, tets)
 
     return domain, V, bc_set, lam, mu, dx, elem_vols, centroids, tets, W
+
 
 def _penalized_solve(
     domain, V, bc_set, lam, mu, dx,
@@ -131,14 +146,8 @@ def _penalized_solve(
 ) -> tuple[fem.Function, np.ndarray]:
     """
     Solve FEA with penalized stiffness field.
-    Builds a DG0 stiffness modulation function from rho^penal,
-    injects it into the bilinear form, and solves.
-
     Returns (displacement_function, element_strain_energies).
-    Element strain energy = 0.5 * rho_e^penal * u_e^T K_e^0 u_e
-    This is the sensitivity dc/drho_e up to the penalization factor.
     """
-    # Density as DG0 function
     rho_fn = fem.Function(W, name="density")
     rho_fn.x.array[:] = rho
 
@@ -149,10 +158,8 @@ def _penalized_solve(
         return ufl.sym(ufl.grad(w))
 
     def sigma0(w):
-        # Base stiffness — without density penalization
         return lam * ufl.tr(eps(w)) * ufl.Identity(len(w)) + 2 * mu * eps(w)
 
-    # Penalized bilinear form — stiffness scaled by rho^penal
     a = rho_fn**penal * ufl.inner(sigma0(u), eps(v)) * dx
 
     T  = fem.Constant(domain, bc_set.traction_vec)
@@ -166,10 +173,12 @@ def _penalized_solve(
     )
     u_sol = problem.solve()
 
-    # Element strain energies (sensitivities)
+    # Element strain energies — used for compliance and sensitivities
     strain_energy_expr = ufl.inner(sigma0(u_sol), eps(u_sol))
-    se_fn  = fem.Function(W)
-    se_expr = fem.Expression(strain_energy_expr, W.element.interpolation_points())
+    se_fn   = fem.Function(W)
+    se_expr = fem.Expression(
+        strain_energy_expr, W.element.interpolation_points()
+    )
     se_fn.interpolate(se_expr)
 
     return u_sol, se_fn.x.array.copy()
@@ -184,15 +193,9 @@ def _oc_update(
     rho_min: float,
 ) -> np.ndarray:
     """
-    Optimality Criteria density update.
-
-    Bisection on Lagrange multiplier lambda to satisfy volume constraint.
-    rho_new[e] = rho[e] * sqrt(-dc[e] / (lambda * vol[e]))  (clamped)
-
-    The bisection finds the lambda that makes sum(rho_new * vol) = vf * sum(vol).
-    Typically converges in 20-30 bisection steps.
+    Optimality Criteria density update via bisection on Lagrange multiplier.
     """
-    total_vol = elem_vols.sum()
+    total_vol  = elem_vols.sum()
     target_vol = volume_fraction * total_vol
 
     l1, l2 = 1e-9, 1e9
@@ -203,8 +206,9 @@ def _oc_update(
                   np.maximum(rho - move,
                   np.minimum(1.0,
                   np.minimum(rho + move,
-                  rho * np.sqrt(np.maximum(0.0, -dc) / (lmid * elem_vols + 1e-16))
-                  ))))
+                  rho * np.sqrt(
+                      np.maximum(0.0, -dc) / (lmid * elem_vols + 1e-16)
+                  )))))
         if (rho_new * elem_vols).sum() > target_vol:
             l1 = lmid
         else:
@@ -228,13 +232,9 @@ def run_simp(
 ) -> SIMPResult:
     """
     Full SIMP optimization loop.
-
-    checkpoint_callback: optional fn(iteration, rho, compliance) called
-                         every checkpoint_every iterations — use for live
-                         progress monitoring in the notebook.
     """
-    config      = config or SIMPConfig()
-    output_dir  = Path(output_dir)
+    config     = config or SIMPConfig()
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     petsc_options = petsc_options or {
@@ -243,7 +243,7 @@ def run_simp(
         "pc_factor_mat_solver_type": "mumps",
     }
 
-    t0 = time.perf_counter()
+    t0                 = time.perf_counter()
     compliance_history = []
     volume_history     = []
 
@@ -256,11 +256,14 @@ def run_simp(
         )
         n_elem = len(elem_vols)
         print(f"  Elements: {n_elem:,}")
+        print(f"  Total volume: {elem_vols.sum()*1e6:.2f} cm³")
 
         # ── Density filter matrix (built once) ───────────────────────────
         print(f"Building filter matrix (r={config.filter_radius}mm)...")
-        H = build_filter_matrix(centroids, config.filter_radius)
-        print(f"  Filter matrix: {H.nnz:,} nonzeros ({100*H.nnz/n_elem**2:.3f}% fill)")
+        H  = build_filter_matrix(centroids, config.filter_radius)
+        Hs = np.array(H.sum(axis=1)).ravel()
+        print(f"  Filter matrix: {H.nnz:,} nonzeros "
+              f"({100*H.nnz/n_elem**2:.3f}% fill)")
 
         # ── Initialize density field ──────────────────────────────────────
         rho = np.full(n_elem, config.volume_fraction, dtype=np.float64)
@@ -269,7 +272,6 @@ def run_simp(
         rho_change = np.inf
         comm       = MPI.COMM_WORLD
 
-        # ── XDMF writer for density checkpoints ──────────────────────────
         density_path = output_dir / f"{part_name}_density.xdmf"
         density_fn   = fem.Function(W, name="density")
 
@@ -279,7 +281,7 @@ def run_simp(
             rho_old = rho.copy()
 
             # Step 1: filter density
-            rho_filtered = apply_filter(H, rho)
+            rho_filtered = (H @ rho) / (Hs + 1e-16)
 
             # Step 2: penalized FEA solve
             u_sol, strain_energies = _penalized_solve(
@@ -287,19 +289,16 @@ def run_simp(
                 rho_filtered, W, config.penal, petsc_options
             )
 
-            # Step 3: compliance (objective)
-            compliance = float(comm.allreduce(
-                fem.assemble_scalar(fem.form(
-                    rho_filtered**config.penal *
-                    ufl.inner(ufl.sym(ufl.grad(u_sol)), ufl.sym(ufl.grad(u_sol))) * dx
-                )), op=MPI.SUM
+            # Step 3: compliance = weighted sum of element strain energies
+            # Avoids expensive JIT recompilation — pure numpy
+            compliance = float(np.sum(
+                rho_filtered**config.penal * strain_energies
             ))
             compliance_history.append(compliance)
 
-            # Step 4: sensitivities dc/drho_e
-            dc_raw  = -config.penal * rho_filtered**(config.penal - 1) * strain_energies
-            Hs      = np.array(H.sum(axis=1)).ravel()
-            dc      = (H.T @ (dc_raw / (Hs + 1e-16)))
+            # Step 4: sensitivities dc/drho_e with filter chain rule
+            dc_raw = -config.penal * rho_filtered**(config.penal - 1) * strain_energies
+            dc     = (H.T @ (dc_raw / (Hs + 1e-16)))
 
             # Step 5: OC density update
             rho = _oc_update(
@@ -322,7 +321,6 @@ def run_simp(
                 with io.XDMFFile(comm, str(density_path), "w") as xdmf:
                     xdmf.write_mesh(domain)
                     xdmf.write_function(density_fn)
-
                 if checkpoint_callback:
                     checkpoint_callback(iteration, rho.copy(), compliance)
 
