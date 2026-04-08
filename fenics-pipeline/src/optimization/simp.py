@@ -91,8 +91,14 @@ def _load_mesh_and_bcs(
             domain.topology.dim - 1, domain.topology.dim
         )
 
-    # Convert mm → m — gmsh outputs in mm, FEniCSx assumes SI (metres)
-    domain.geometry.x[:] /= 1000.0
+    # Convert mm → m only if coordinates suggest mm scale
+    # opt_domain mesh is already in metres; bracket mesh is in mm
+    coord_max = domain.geometry.x.max()
+    if coord_max > 1.0:   # if max coordinate > 1m, assume mm and convert
+        domain.geometry.x[:] /= 1000.0
+        print("  Converted coordinates mm → m")
+    else:
+        print("  Coordinates already in metres")
 
     facet_tags = load_boundary_mesh(str(boundaries_xdmf), domain)
 
@@ -128,6 +134,10 @@ def _load_mesh_and_bcs(
     a_v = v1 - v0
     b_v = v2 - v0
     c_v = v3 - v0
+    # For highly non-uniform meshes, use uniform element volumes
+    # Actual tet volumes span 330,000x range which breaks the OC volume constraint
+    # — a few large elements satisfy the constraint while small elements stay solid
+    # Using uniform weights makes the constraint element-count based instead
     elem_vols = np.abs(np.einsum('ij,ij->i', a_v, np.cross(b_v, c_v))) / 6.0
 
     # Element centroids for density filter
@@ -195,7 +205,7 @@ def _oc_update(
     total_vol  = elem_vols.sum()
     target_vol = volume_fraction * total_vol
 
-    l1, l2 = 1e-6, 1e6
+    l1, l2 = 1e-3, 1e15
 
     lmid = 0.5 * (l1 + l2)
     test = rho * np.sqrt(np.maximum(0.0, -dc) / (lmid * elem_vols + 1e-16))
@@ -302,10 +312,6 @@ def run_simp(
             # Step 4: sensitivities dc/drho_e with filter chain rule
             dc_raw = -config.penal * rho_filtered**(config.penal - 1) * strain_energies
             dc     = (H.T @ (dc_raw / (Hs + 1e-16)))
-
-            # Normalize to [-1, 0] range so OC bisection works regardless
-            # of unit system or load magnitude
-            dc = dc / (np.abs(dc).max() + 1e-16)
 
 
             # Step 5: OC density update
