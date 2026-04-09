@@ -253,8 +253,9 @@ def run_simp(
             energy_fn.interpolate(energy_expr)
             strain_energies = energy_fn.x.array.copy()
 
-            # Step 4: compliance
-            compliance = float(np.dot(x**config.penal, strain_energies))
+            # Step 4: compliance — volume-integrated (physical Joules)
+            # strain_energies is density [Pa]; multiply by cell_volumes to get [J]
+            compliance = float(np.dot(x**config.penal * cell_volumes, strain_energies))
             compliance_history.append(compliance)
 
             # Step 5: raw sensitivities
@@ -264,7 +265,11 @@ def run_simp(
             dc_filtered = (omega @ dc) / (omega_sum + 1e-16)
 
             # Only optimize design elements — exclude non-design from OC
-            ocp  = x * np.sqrt(np.maximum(0.0, -dc_filtered) / (cell_volumes + 1e-16))
+            # NOTE: dc is strain energy *density* (not volume-integrated), so cell_volumes
+            # must NOT appear here. Adding 1/v_e would produce ranking inversions on
+            # non-uniform meshes (small corner tets near pins get spuriously boosted).
+            # Correct KKT-derived formula: ocp = x * sqrt(-dc_density_filtered)
+            ocp  = x * np.sqrt(np.maximum(0.0, -dc_filtered))
             ocp[nondesign_mask] = 0.0
             l1   = 0.0
             l2   = ocp.sum() + 1e-30   # upper bound from all elements
