@@ -16,7 +16,14 @@
   },
   "load_hints": {
     "primary_face": "top",
-    "load_magnitude_n": 13000.0
+    "load_magnitude_n": 10000.0
+  },
+  "boundary_conditions": {
+    "fixed_face": "corners",
+    "load_face": "top",
+    "load_direction": [0.0, 0.0, -1.0],
+    "hole_inset_fraction": 0.20,
+    "shell_thickness_mm": 2.0
   },
   "export": {
     "stl_output_dir": "outputs/meshes",

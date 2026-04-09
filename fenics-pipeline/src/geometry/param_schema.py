@@ -3,10 +3,9 @@
 # Typed schema for pipeline parameters.
 # Validates params.json at load time so bad values fail here,
 # not mid-solve in 03_fea_fenicsx.ipynb.
-
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 import json
 from pathlib import Path
 
@@ -43,6 +42,56 @@ class MeshHints:
 
 
 @dataclass
+class BoundaryConditions:
+    """
+    Describes how the part is fixed and loaded for FEA and topology optimization.
+
+    fixed_face:
+        Which face is fully fixed (encastre), OR "corners" to fix only the
+        corner mounting-hole regions on that face.
+        Face names: "top" (+Z), "bottom" (-Z), "left" (-X), "right" (+X),
+                    "front" (-Y), "back" (+Y), "corners" (corner regions on bottom)
+
+    load_face:
+        Which face the traction load is applied to.
+        Same face names as above, excluding "corners".
+
+    load_direction:
+        [x, y, z] vector for load direction. Will be normalized internally.
+        Default [0, 0, -1] = downward (-Z).
+
+    hole_inset_fraction:
+        When fixed_face="corners", the fraction of part length/width used as
+        the corner region size. 0.15 = 15% inset matches a typical 4-hole bracket.
+
+    shell_thickness_mm:
+        Enforce a solid outer shell of this thickness (mm) in Stage 5 STL export.
+        Prevents open surfaces at part boundaries. Set to 0 to disable.
+    """
+    fixed_face:           str   = "corners"
+    load_face:            str   = "top"
+    load_direction:       List  = field(default_factory=lambda: [0.0, 0.0, -1.0])
+    hole_inset_fraction:  float = 0.15
+    shell_thickness_mm:   float = 2.0
+
+    VALID_FACES = {"top", "bottom", "left", "right", "front", "back", "corners"}
+
+    def validate(self) -> None:
+        assert self.fixed_face in self.VALID_FACES, \
+            f"fixed_face must be one of {self.VALID_FACES}"
+        assert self.load_face in self.VALID_FACES - {"corners"}, \
+            f"load_face must be one of {self.VALID_FACES - {'corners'}}"
+        assert self.fixed_face != self.load_face, \
+            "fixed_face and load_face cannot be the same"
+        assert 0.0 < self.hole_inset_fraction < 0.5, \
+            "hole_inset_fraction must be between 0 and 0.5"
+        assert len(self.load_direction) == 3, \
+            "load_direction must be a 3-element list [x, y, z]"
+        assert self.shell_thickness_mm >= 0, \
+            "shell_thickness_mm must be >= 0"
+
+
+@dataclass
 class LoadHints:
     primary_face:     str
     load_magnitude_n: float
@@ -63,39 +112,47 @@ class ExportParams:
 
 @dataclass
 class PipelineParams:
-    part_name:  str
-    geometry:   GeometryParams
-    mesh_hints: MeshHints
-    load_hints: LoadHints
-    export:     ExportParams
+    part_name:            str
+    geometry:             GeometryParams
+    mesh_hints:           MeshHints
+    load_hints:           LoadHints
+    export:               ExportParams
+    boundary_conditions:  BoundaryConditions = field(
+        default_factory=BoundaryConditions
+    )
 
     def validate(self) -> None:
         """Run all sub-validators. Call this immediately after loading."""
         self.geometry.validate()
         self.mesh_hints.validate()
         self.load_hints.validate()
+        self.boundary_conditions.validate()
 
     @classmethod
     def from_json(cls, path: str | Path) -> "PipelineParams":
         """Load and validate params from a JSON file."""
         raw = json.loads(Path(path).read_text())
-        return cls(
-            part_name=raw["part_name"],
-            geometry=GeometryParams(**raw["geometry"]),
-            mesh_hints=MeshHints(**raw["mesh_hints"]),
-            load_hints=LoadHints(**raw["load_hints"]),
-            export=ExportParams(**raw["export"]),
-        )
+        return cls._from_raw(raw)
 
     @classmethod
     def from_dict(cls, raw: dict) -> "PipelineParams":
         """Load params from a plain dict — used by generate_test_cases notebook."""
+        return cls._from_raw(raw)
+
+    @classmethod
+    def _from_raw(cls, raw: dict) -> "PipelineParams":
+        """Shared deserialization with backward-compatible BC loading.
+        If boundary_conditions is absent from params.json, sensible defaults apply.
+        """
+        bc_raw = raw.get("boundary_conditions", {})
         return cls(
             part_name=raw["part_name"],
             geometry=GeometryParams(**raw["geometry"]),
             mesh_hints=MeshHints(**raw["mesh_hints"]),
             load_hints=LoadHints(**raw["load_hints"]),
             export=ExportParams(**raw["export"]),
+            boundary_conditions=BoundaryConditions(**bc_raw) if bc_raw
+                                else BoundaryConditions(),
         )
 
     def to_openscad_defines(self) -> dict[str, float | str | bool]:
