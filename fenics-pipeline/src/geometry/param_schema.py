@@ -34,11 +34,14 @@ class GeometryParams:
 
 @dataclass
 class MeshHints:
-    target_element_size: float
-    refinement_regions:  List = field(default_factory=list)
+    target_element_size:        float
+    opt_domain_element_size_mm: float = 2.5
+    refinement_regions:         List  = field(default_factory=list)
 
     def validate(self) -> None:
         assert self.target_element_size > 0, "target_element_size must be > 0"
+        assert self.opt_domain_element_size_mm > 0, \
+            "opt_domain_element_size_mm must be > 0"
 
 
 @dataclass

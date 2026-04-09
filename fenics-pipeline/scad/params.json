@@ -12,6 +12,7 @@
   },
   "mesh_hints": {
     "target_element_size": 8.0,
+    "opt_domain_element_size_mm": 2.5,
     "refinement_regions": []
   },
   "load_hints": {
