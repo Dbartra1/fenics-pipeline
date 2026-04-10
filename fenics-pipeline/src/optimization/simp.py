@@ -297,7 +297,7 @@ def run_simp(
             x_new[nondesign_mask] = 1.0
             x = x_new
 
-            # Step 8: convergence
+            # Step 7: convergence
             rho_change = float(np.max(np.abs(x - x_old)))
             design_vol_total = cell_volumes[design_mask].sum()
             vol_frac = float((x[design_mask] * cell_volumes[design_mask]).sum()
@@ -332,7 +332,9 @@ def run_simp(
             xdmf.write_function(rho)
 
         if not converged:
-            frac_intermediate = np.logical_and(0.15 < x, x < 0.85).sum() / n_elem
+            frac_intermediate = np.logical_and(
+                0.15 < x[design_mask], x[design_mask] < 0.85
+            ).sum() / design_mask.sum()
             print(f"\n⚠ Did not converge in {config.max_iterations} iterations "
                   f"(Δρ={rho_change:.2e}, {frac_intermediate*100:.1f}% intermediate)")
 
