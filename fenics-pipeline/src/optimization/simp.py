@@ -309,7 +309,7 @@ def run_simp(
                     break
 
             x_new[nondesign_mask] = 1.0
-            x = x_new
+            x = 0.5 * x_new + 0.5 * x   # OC damping — breaks 2-cycle oscillation
 
             # Step 7: convergence
             rho_change = float(np.max(np.abs(x - x_old)))
@@ -333,7 +333,17 @@ def run_simp(
             frac_intermediate = np.logical_and(
                 0.15 < x[design_mask], x[design_mask] < 0.85
             ).sum() / design_mask.sum()
-            if rho_change < config.convergence_tol or frac_intermediate < 0.01:
+
+            # Compliance-based convergence — catches flat objective with oscillating Δρ
+            if iteration > 10:
+                recent = compliance_history[-10:]
+                rel_spread = (max(recent) - min(recent)) / (max(recent) + 1e-30)
+                if rel_spread < 1e-4:
+                    converged = True
+                    print(f"  ✓ Compliance flat (spread={rel_spread:.2e}) — declaring convergence")
+                    break
+
+            if rho_change < config.convergence_tol:
                 print(f"\n✓ Converged at iteration {iteration} "
                       f"(Δρ={rho_change:.2e}, {frac_intermediate*100:.1f}% intermediate)")
                 converged = True
