@@ -97,6 +97,7 @@ def run_simp(
     checkpoint_callback: Optional[Callable[[int, np.ndarray, float], None]] = None,
     bc_params=None,
     geometry_params=None,
+    x_init: Optional[np.ndarray] = None,
 ) -> SIMPResult:
     """
     Full SIMP optimization loop.
@@ -238,8 +239,21 @@ def run_simp(
 
         converged  = False
         rho_change = np.inf
-        x = rho.x.array.copy()
-        x[nondesign_mask] = 1.0   # non-design starts solid
+
+        if x_init is not None:
+            # Warm-start from provided density field
+            if len(x_init) != n_elem:
+                raise ValueError(
+                    f"x_init length {len(x_init)} != n_elem {n_elem}"
+                )
+            x = x_init.copy().astype(np.float64)
+            x = np.clip(x, config.rho_min, 1.0)
+            print(f"  Warm-start: x_init provided "
+                  f"(mean={x.mean():.3f}, min={x.min():.4f}, max={x.max():.4f})")
+        else:
+            x = rho.x.array.copy()
+
+        x[nondesign_mask] = 1.0   # non-design always solid
 
         # ── Optimization loop ─────────────────────────────────────────────
         for iteration in range(1, config.max_iterations + 1):
@@ -295,7 +309,7 @@ def run_simp(
                     break
 
             x_new[nondesign_mask] = 1.0
-            x = x_new
+            x = 0.5 * x_new + 0.5 * x   # OC damping — breaks 2-cycle oscillation
 
             # Step 7: convergence
             rho_change = float(np.max(np.abs(x - x_old)))
@@ -319,7 +333,17 @@ def run_simp(
             frac_intermediate = np.logical_and(
                 0.15 < x[design_mask], x[design_mask] < 0.85
             ).sum() / design_mask.sum()
-            if rho_change < config.convergence_tol or frac_intermediate < 0.01:
+
+            # Compliance-based convergence — catches flat objective with oscillating Δρ
+            if iteration > 10:
+                recent = compliance_history[-10:]
+                rel_spread = (max(recent) - min(recent)) / (max(recent) + 1e-30)
+                if rel_spread < 1e-4:
+                    converged = True
+                    print(f"  ✓ Compliance flat (spread={rel_spread:.2e}) — declaring convergence")
+                    break
+
+            if rho_change < config.convergence_tol:
                 print(f"\n✓ Converged at iteration {iteration} "
                       f"(Δρ={rho_change:.2e}, {frac_intermediate*100:.1f}% intermediate)")
                 converged = True

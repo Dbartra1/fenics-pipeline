@@ -302,6 +302,10 @@ def run_meshing_pipeline(
         configure_mesh_algorithm(target_element_size, algorithm_3d=algorithm_3d)
         gmsh.model.mesh.generate(3)
 
+        # Optimize mesh quality — reduces bad aspect ratios and flat tets
+        gmsh.model.mesh.optimize("Netgen")
+        gmsh.model.mesh.optimize("")
+
         # Phase 3: tag physical groups for FEniCSx BCs
         physical_tags = tag_physical_groups()
         if "volume" not in physical_tags:
