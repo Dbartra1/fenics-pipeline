@@ -131,6 +131,7 @@ def build_boundary_conditions_geometric(
     domain: dolfinx.mesh.Mesh,
     load_hints: dict,
     bc_params=None,
+    geometry_params=None,
 ) -> BoundaryConditionSet:
     """
     Geometry-based BC builder — used by simp.py (Stage 4).
@@ -144,8 +145,17 @@ def build_boundary_conditions_geometric(
         "top", "bottom", "left", "right", "front", "back"
             — fully fix the named face (encastre)
         "corners"
-            — fix only the 4 corner regions on the bottom face,
-              sized by bc_params.hole_inset_fraction (default 15%)
+            — fix only the 4 corner mounting-hole regions on the bottom face.
+              When geometry_params (a GeometryParams dataclass) is provided,
+              uses a disk predicate centred on each hole with radius
+              (hole_diameter/2 + 2mm washer margin) — physically correct for
+              a bolted joint. Falls back to a rectangular corner patch sized by
+              bc_params.hole_inset_fraction when geometry_params is None.
+
+    geometry_params: Optional[GeometryParams]
+        When provided and fixed_face=="corners", drives the disk predicate from
+        mounting_hole_diameter and mounting_hole_inset in the params. All values
+        are in mm (converted to metres internally to match domain coordinates).
     """
     from dolfinx.mesh import locate_entities_boundary, meshtags
 
@@ -185,16 +195,59 @@ def build_boundary_conditions_geometric(
 
     # ── Dirichlet (fixed) boundary ────────────────────────────────────────
     if bc_params.fixed_face == "corners":
-        # Fix 4 corner regions on bottom face — models mounting holes
-        frac  = bc_params.hole_inset_fraction
-        x_tol = (x_max - x_min) * frac
-        y_tol = (y_max - y_min) * frac
+        if geometry_params is not None:
+            # ── Disk predicate — physically correct for bolted joints ──────
+            # Constrain a disk of radius (hole_r + 2mm washer margin) centred
+            # on each mounting hole. Avoids the spurious stress concentration
+            # from over-constraining a large rectangular corner patch.
+            #
+            # geometry_params values are in mm; domain coordinates are in
+            # metres (mm→m conversion happens in simp.py before this call).
+            WASHER_MARGIN_M = 0.002   # 2 mm expressed in metres
+            hole_r_m   = (geometry_params.mounting_hole_diameter / 2.0) / 1000.0
+            inset_m    = geometry_params.mounting_hole_inset / 1000.0
+            bc_disk_r  = hole_r_m + WASHER_MARGIN_M
 
-        def corner_predicate(x):
-            on_bottom   = np.isclose(x[2], z_min, atol=tol)
-            near_x_edge = (x[0] < x_min + x_tol) | (x[0] > x_max - x_tol)
-            near_y_edge = (x[1] < y_min + y_tol) | (x[1] > y_max - y_tol)
-            return on_bottom & near_x_edge & near_y_edge
+            hole_centers = [
+                (x_min + inset_m, y_min + inset_m),
+                (x_max - inset_m, y_min + inset_m),
+                (x_min + inset_m, y_max - inset_m),
+                (x_max - inset_m, y_max - inset_m),
+            ]
+
+            # Use a slightly relaxed z-tolerance: gmsh Delaunay can introduce
+            # coordinate noise at ~1e-7m; 1e-4 (0.1mm) is safe for any part
+            # taller than 1mm while avoiding spurious facet capture.
+            z_tol_bc = 1e-4
+
+            def corner_predicate(x):
+                on_bottom  = np.isclose(x[2], z_min, atol=z_tol_bc)
+                near_hole  = np.zeros(x.shape[1], dtype=bool)
+                for hx, hy in hole_centers:
+                    near_hole |= (
+                        np.sqrt((x[0] - hx)**2 + (x[1] - hy)**2) < bc_disk_r
+                    )
+                return on_bottom & near_hole
+
+            print(f"  Corner BC: disk predicate, r={bc_disk_r*1000:.1f}mm, "
+                  f"{len(hole_centers)} holes at inset={inset_m*1000:.1f}mm")
+        else:
+            # ── Rectangular fallback — used when geometry_params unavailable ─
+            # Falls back to the original rectangular corner patch sized by
+            # hole_inset_fraction. Less physically accurate but always works.
+            frac  = bc_params.hole_inset_fraction
+            x_tol = (x_max - x_min) * frac
+            y_tol = (y_max - y_min) * frac
+
+            def corner_predicate(x):
+                on_bottom   = np.isclose(x[2], z_min, atol=tol)
+                near_x_edge = (x[0] < x_min + x_tol) | (x[0] > x_max - x_tol)
+                near_y_edge = (x[1] < y_min + y_tol) | (x[1] > y_max - y_tol)
+                return on_bottom & near_x_edge & near_y_edge
+
+            print(f"  Corner BC: rectangular fallback "
+                  f"(pass geometry_params for disk predicate), "
+                  f"frac={frac:.2f}")
 
         fixed_facets = locate_entities_boundary(domain, fdim, corner_predicate)
     else:

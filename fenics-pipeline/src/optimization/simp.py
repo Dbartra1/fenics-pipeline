@@ -96,6 +96,7 @@ def run_simp(
     petsc_options: Optional[dict] = None,
     checkpoint_callback: Optional[Callable[[int, np.ndarray, float], None]] = None,
     bc_params=None,
+    geometry_params=None,
 ) -> SIMPResult:
     """
     Full SIMP optimization loop.
@@ -188,7 +189,9 @@ def run_simp(
         print(f"  Filter: {omega.nnz:,} nonzeros, {omega.nnz/n_elem:.0f} avg neighbors")
 
         # ── Boundary conditions ───────────────────────────────────────────
-        bc_set = build_boundary_conditions_geometric(CG1, domain, load_hints, bc_params)
+        bc_set = build_boundary_conditions_geometric(
+            CG1, domain, load_hints, bc_params, geometry_params
+        )
 
         # ── Density function (updated in-place each iteration) ────────────
         rho = Function(DG0, name="density")
