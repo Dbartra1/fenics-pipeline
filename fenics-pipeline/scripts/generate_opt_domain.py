@@ -13,10 +13,9 @@ Design domain strategy:
 
 The mesh tags used:
   Tag 1 = design volume       (optimizer controls density here)
-  Tag 2 = non-design volume   (density forced to 1.0 — always solid)
+  Tag 2 = top face
   Tag 3 = bottom face
-  Tag 4 = top face
-  Tag 5 = side faces
+  Tag 4 = side faces
 
 Usage:
     python3 generate_opt_domain.py [params_json_path]
@@ -37,12 +36,20 @@ import meshio
 def generate_opt_domain(
     params_path: str = "scad/params.json",
     output_dir:  str = "outputs/meshes",
-    element_size_m: float = 0.0015,   # 1.5mm
+    element_size_m: float = None,   # if None, reads from params mesh_hints.opt_domain_element_size_mm
     hole_wall_thickness_m: float = 0.004,  # 4mm non-design ring around each hole
 ):
     params    = json.loads(Path(params_path).read_text())
     geom      = params["geometry"]
     bc_params = params.get("boundary_conditions", {})
+
+    # Resolve element size — params is the source of truth, arg allows override
+    if element_size_m is None:
+        element_size_mm = params.get("mesh_hints", {}).get(
+            "opt_domain_element_size_mm", 2.5
+        )
+        element_size_m = element_size_mm / 1000.0
+    print(f"Opt domain element size: {element_size_m*1000:.1f}mm")
 
     # Part dimensions (convert mm → m)
     L = geom["length"]           / 1000.0
@@ -172,15 +179,16 @@ def generate_opt_domain(
               y_lo < 1e-6 or y_hi > W - 1e-6):
             side_surfs.append(tag)
 
+    # Tags must match TAG_TOP=2, TAG_BOTTOM=3, TAG_SIDES=4 in boundary_conditions.py
     if bottom_surfs:
         gmsh.model.addPhysicalGroup(2, bottom_surfs, tag=3)
         gmsh.model.setPhysicalName(2, 3, "bottom")
     if top_surfs:
-        gmsh.model.addPhysicalGroup(2, top_surfs, tag=4)
-        gmsh.model.setPhysicalName(2, 4, "top")
+        gmsh.model.addPhysicalGroup(2, top_surfs, tag=2)
+        gmsh.model.setPhysicalName(2, 2, "top")
     if side_surfs:
-        gmsh.model.addPhysicalGroup(2, side_surfs, tag=5)
-        gmsh.model.setPhysicalName(2, 5, "sides")
+        gmsh.model.addPhysicalGroup(2, side_surfs, tag=4)
+        gmsh.model.setPhysicalName(2, 4, "sides")
 
     # ── Step 7: Mesh ──────────────────────────────────────────────────────
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", element_size_m)
