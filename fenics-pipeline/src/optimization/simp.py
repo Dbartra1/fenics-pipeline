@@ -97,6 +97,7 @@ def run_simp(
     checkpoint_callback: Optional[Callable[[int, np.ndarray, float], None]] = None,
     bc_params=None,
     geometry_params=None,
+    x_init: Optional[np.ndarray] = None,
 ) -> SIMPResult:
     """
     Full SIMP optimization loop.
@@ -238,8 +239,21 @@ def run_simp(
 
         converged  = False
         rho_change = np.inf
-        x = rho.x.array.copy()
-        x[nondesign_mask] = 1.0   # non-design starts solid
+
+        if x_init is not None:
+            # Warm-start from provided density field
+            if len(x_init) != n_elem:
+                raise ValueError(
+                    f"x_init length {len(x_init)} != n_elem {n_elem}"
+                )
+            x = x_init.copy().astype(np.float64)
+            x = np.clip(x, config.rho_min, 1.0)
+            print(f"  Warm-start: x_init provided "
+                  f"(mean={x.mean():.3f}, min={x.min():.4f}, max={x.max():.4f})")
+        else:
+            x = rho.x.array.copy()
+
+        x[nondesign_mask] = 1.0   # non-design always solid
 
         # ── Optimization loop ─────────────────────────────────────────────
         for iteration in range(1, config.max_iterations + 1):
