@@ -81,6 +81,8 @@ def _build_filter(centroids: np.ndarray, filter_radius_m: float):
     distance = tree.sparse_distance_matrix(tree, filter_radius_m).tocsr()
     distance.data = (filter_radius_m - distance.data) / filter_radius_m
     omega = distance
+    # omega_sum is kept for the unweighted fallback path; the main loop
+    # now uses the x-weighted denominator (omega @ x) instead.
     omega_sum = np.array(omega.sum(axis=1)).flatten()
     return omega, omega_sum
 
@@ -297,7 +299,12 @@ def run_simp(
             dc = -config.penal * x**(config.penal - 1) * strain_energies
 
             # Step 6: filter sensitivities
-            dc_filtered = (omega @ dc) / (omega_sum + 1e-16)
+            # Step 6: filter sensitivities — KKT-correct x-weighted form
+            # dc_filtered_e = Σ_f H_ef · x_f · dc_f / Σ_f H_ef · x_f
+            # This suppresses sensitivity contributions from near-void neighbors
+            # proportionally to their density, preventing boundary amplification.
+            # Reference: Sigmund (2001) eq. 5
+            dc_filtered = (omega @ (x * dc)) / (omega @ x + 1e-16)
 
             # Only optimize design elements — exclude non-design from OC
             # NOTE: dc is strain energy *density* (not volume-integrated), so cell_volumes
