@@ -24,6 +24,9 @@ __pycache__/
 test_cases/*/outputs/
 test_cases/_previews/
 
+solver/target/
+bin/simp_solver
+
 # Logs
 outputs/logs/
 
