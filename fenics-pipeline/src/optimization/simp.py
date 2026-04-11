@@ -314,7 +314,12 @@ def run_simp(
             ocp  = x * np.sqrt(np.maximum(0.0, -dc_filtered))
             ocp[nondesign_mask] = 0.0
             l1   = 0.0
-            l2   = ocp.sum() + 1e-30   # upper bound from all elements
+            # Tight upper bound: l large enough that x_new[e] = x[e] - move for all e.
+            # ocp[e] / l_mid ≤ x[e] - move when l_mid ≥ ocp[e] / (x[e] - move).
+            # Worst case is max(ocp) / rho_min (since x ≥ rho_min and move < rho_min
+            # is impossible by config). Guaranteed vol(x_new) < VF at l2.
+            ocp_max = ocp[design_mask].max() if design_mask.any() else 1.0
+            l2   = ocp_max / (config.rho_min + 1e-30)
             move = config.move
 
             for _ in range(200):
