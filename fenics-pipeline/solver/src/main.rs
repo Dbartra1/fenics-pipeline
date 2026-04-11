@@ -6,12 +6,14 @@ mod connectivity;
 mod ke_base;
 mod filter;
 mod assembly;
+mod solver;
 
 use types::{Grid, Material, SimpConfig, RHO_MIN};
 use connectivity::{precompute_connectivity, precompute_dof_map};
 use ke_base::compute_ke_base;
 use filter::build_filter;
-use assembly::{build_csr_pattern, assemble_k, csr_matvec};
+use assembly::{apply_dirichlet, assemble_k, build_csr_pattern, csr_matvec};
+use solver::cg_solve_direct;
 
 fn main() {
     // ── types smoke ───────────────────────────────────────────────────────────
@@ -68,12 +70,52 @@ fn main() {
         &vec![false; n_elem], &vec![false; n_elem], cfg.penal,
     );
 
-    // Rigid body x-translation → zero force
+    // ── solver smoke ──────────────────────────────────────────────────────────
+    // Fix bottom face, apply unit z-load on top face, solve.
+    let nx = grid.nx; let ny = grid.ny;
+    let fixed_dofs: Vec<usize> = (0..=(nx)*(ny+1)-(ny+1))
+        .flat_map(|n| [3*n, 3*n+1, 3*n+2])
+        .collect();
+
+    // Bottom face nodes: iz=0, all ix,iy
+    let fixed_dofs: Vec<usize> = {
+        let mut v = Vec::new();
+        for iy in 0..=grid.ny {
+            for ix in 0..=grid.nx {
+                let n = grid.node_idx(ix, iy, 0);
+                v.extend_from_slice(&[3*n, 3*n+1, 3*n+2]);
+            }
+        }
+        v
+    };
+
+    let diag_mean: f64 = (0..grid.n_dof())
+        .map(|i| {
+            let row = &pattern.k_cols[pattern.k_rows[i]..pattern.k_rows[i+1]];
+            let pos = row.binary_search(&i).unwrap();
+            k_vals[pattern.k_rows[i] + pos]
+        })
+        .sum::<f64>() / grid.n_dof() as f64;
+
+    apply_dirichlet(&mut k_vals, &pattern.k_rows, &pattern.k_cols,
+                    &fixed_dofs, diag_mean);
+
+    let mut f_vec = vec![0.0f64; grid.n_dof()];
+    let top_count = (grid.nx + 1) * (grid.ny + 1);
+    for iy in 0..=grid.ny {
+        for ix in 0..=grid.nx {
+            let n = grid.node_idx(ix, iy, grid.nz);
+            f_vec[3*n + 2] = -10000.0 / top_count as f64;
+        }
+    }
+    for &d in &fixed_dofs { f_vec[d] = 0.0; }
+
     let mut u = vec![0.0f64; grid.n_dof()];
-    for i in (0..grid.n_dof()).step_by(3) { u[i] = 1.0; }
-    let f = csr_matvec(&pattern.k_rows, &pattern.k_cols, &k_vals, &u);
-    let f_max = f.iter().cloned().fold(0.0f64, f64::max.clone());
-    println!("K·u (rigid x-translation), max force component: {f_max:.3e}  (should be ~0)");
+    let result = cg_solve_direct(
+        &pattern.k_rows, &pattern.k_cols, &k_vals, &f_vec, &mut u, 1e-8, grid.n_dof() * 2
+    );
+    println!("CG solve: {} iters, rel_res={:.3e}, converged={}", 
+             result.iterations, result.rel_residual, result.converged);
 
     println!("\n✓ All smoke checks passed.");
 }
