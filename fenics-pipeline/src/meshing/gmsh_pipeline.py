@@ -179,23 +179,26 @@ def tag_physical_groups() -> dict[str, int]:
     surface_centroids.sort(key=lambda x: x[1])
 
     # Bottom surface — fixed boundary in Stage 3
+    # TAG_BOTTOM=3 must match boundary_conditions.py constant
     bot_tag = surface_centroids[0][0]
-    phys_bot = gmsh.model.addPhysicalGroup(2, [bot_tag])
-    gmsh.model.setPhysicalName(2, phys_bot, "bottom")
-    tags["bottom"] = phys_bot
+    phys_bot = gmsh.model.addPhysicalGroup(2, [bot_tag], tag=3)
+    gmsh.model.setPhysicalName(2, 3, "bottom")
+    tags["bottom"] = 3
 
     # Top surface — load application point in Stage 3
+    # TAG_TOP=2 must match boundary_conditions.py constant
     top_tag = surface_centroids[-1][0]
-    phys_top = gmsh.model.addPhysicalGroup(2, [top_tag])
-    gmsh.model.setPhysicalName(2, phys_top, "top")
-    tags["top"] = phys_top
+    phys_top = gmsh.model.addPhysicalGroup(2, [top_tag], tag=2)
+    gmsh.model.setPhysicalName(2, 2, "top")
+    tags["top"] = 2
 
     # Remaining surfaces — side walls
+    # TAG_SIDES=4 must match boundary_conditions.py constant
     side_tags = [s[0] for s in surface_centroids[1:-1]]
     if side_tags:
-        phys_sides = gmsh.model.addPhysicalGroup(2, side_tags)
-        gmsh.model.setPhysicalName(2, phys_sides, "sides")
-        tags["sides"] = phys_sides
+        phys_sides = gmsh.model.addPhysicalGroup(2, side_tags, tag=4)
+        gmsh.model.setPhysicalName(2, 4, "sides")
+        tags["sides"] = 4
 
     return tags
 
