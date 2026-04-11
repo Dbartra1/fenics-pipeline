@@ -169,13 +169,31 @@ def run_simp(
             nondesign_mask = np.zeros(n_elem, dtype=bool)
             if Path(h5_path).exists():
                 with h5py.File(h5_path, "r") as f:
-                    if "data2" in f:
-                        tags = f["data2"][:].ravel()
+                    # Probe candidate keys in priority order.
+                    # meshio XDMF2 writes cell attributes as "data2" (third dataset).
+                    # "data1" appears on some meshio versions; "gmsh:physical" is
+                    # the logical name. If none match, log a warning — do NOT
+                    # silently treat all elements as design.
+                    CANDIDATE_KEYS = ("data2", "data1", "gmsh:physical")
+                    tags = None
+                    for key in CANDIDATE_KEYS:
+                        if key in f:
+                            tags = f[key][:].ravel()
+                            print(f"  Physical tags read from HDF5 key '{key}'")
+                            break
+                    if tags is not None:
                         nondesign_mask = (tags == 2)
-                        print(f"  Non-design elements: {nondesign_mask.sum():,} "
+                        n_nd = nondesign_mask.sum()
+                        print(f"  Non-design elements: {n_nd:,} "
                               f"({100*nondesign_mask.mean():.1f}%) — forced solid")
+                        if n_nd == 0:
+                            print("  ⚠ WARNING: 0 non-design elements detected — "
+                                  "check that generate_opt_domain.py ran and wrote "
+                                  "physical group tag=2 for non-design volumes.")
                     else:
-                        print("  No physical tags found — all elements are design")
+                        print(f"  ⚠ WARNING: No physical tag data found in HDF5 "
+                              f"(tried: {CANDIDATE_KEYS}). "
+                              f"All elements treated as design — hole walls may erode.")
             else:
                 print("  No HDF5 file found — all elements are design")
         except Exception as e:
