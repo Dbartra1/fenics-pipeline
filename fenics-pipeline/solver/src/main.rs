@@ -5,11 +5,13 @@ mod types;
 mod connectivity;
 mod ke_base;
 mod filter;
+mod assembly;
 
 use types::{Grid, Material, SimpConfig, RHO_MIN};
 use connectivity::{precompute_connectivity, precompute_dof_map};
 use ke_base::compute_ke_base;
 use filter::build_filter;
+use assembly::{build_csr_pattern, assemble_k, csr_matvec};
 
 fn main() {
     // ── types smoke ───────────────────────────────────────────────────────────
@@ -50,6 +52,28 @@ fn main() {
         "Filter: elem 0 has {} neighbours, weight_sum={:.4e}",
         fw.weights[0].len(), fw.weight_sums[0]
     );
+
+    // ── assembly smoke ────────────────────────────────────────────────────────
+    let pattern = build_csr_pattern(&grid, &dof_map);
+    let nnz = pattern.k_rows[grid.n_dof()];
+    println!("K: {} DOFs, {} nonzeros, fill={:.4}%",
+        grid.n_dof(), nnz,
+        100.0 * nnz as f64 / (grid.n_dof() * grid.n_dof()) as f64
+    );
+
+    let n_elem = grid.n_elem();
+    let mut k_vals = vec![0.0f64; nnz];
+    assemble_k(
+        &mut k_vals, &vec![1.0f64; n_elem], &ke, &pattern,
+        &vec![false; n_elem], &vec![false; n_elem], cfg.penal,
+    );
+
+    // Rigid body x-translation → zero force
+    let mut u = vec![0.0f64; grid.n_dof()];
+    for i in (0..grid.n_dof()).step_by(3) { u[i] = 1.0; }
+    let f = csr_matvec(&pattern.k_rows, &pattern.k_cols, &k_vals, &u);
+    let f_max = f.iter().cloned().fold(0.0f64, f64::max.clone());
+    println!("K·u (rigid x-translation), max force component: {f_max:.3e}  (should be ~0)");
 
     println!("\n✓ All smoke checks passed.");
 }
