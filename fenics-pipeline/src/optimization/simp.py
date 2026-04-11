@@ -81,6 +81,8 @@ def _build_filter(centroids: np.ndarray, filter_radius_m: float):
     distance = tree.sparse_distance_matrix(tree, filter_radius_m).tocsr()
     distance.data = (filter_radius_m - distance.data) / filter_radius_m
     omega = distance
+    # omega_sum is kept for the unweighted fallback path; the main loop
+    # now uses the x-weighted denominator (omega @ x) instead.
     omega_sum = np.array(omega.sum(axis=1)).flatten()
     return omega, omega_sum
 
@@ -297,7 +299,12 @@ def run_simp(
             dc = -config.penal * x**(config.penal - 1) * strain_energies
 
             # Step 6: filter sensitivities
-            dc_filtered = (omega @ dc) / (omega_sum + 1e-16)
+            # Step 6: filter sensitivities — KKT-correct x-weighted form
+            # dc_filtered_e = Σ_f H_ef · x_f · dc_f / Σ_f H_ef · x_f
+            # This suppresses sensitivity contributions from near-void neighbors
+            # proportionally to their density, preventing boundary amplification.
+            # Reference: Sigmund (2001) eq. 5
+            dc_filtered = (omega @ (x * dc)) / (omega @ x + 1e-16)
 
             # Only optimize design elements — exclude non-design from OC
             # NOTE: dc is strain energy *density* (not volume-integrated), so cell_volumes
@@ -307,7 +314,12 @@ def run_simp(
             ocp  = x * np.sqrt(np.maximum(0.0, -dc_filtered))
             ocp[nondesign_mask] = 0.0
             l1   = 0.0
-            l2   = ocp.sum() + 1e-30   # upper bound from all elements
+            # Tight upper bound: l large enough that x_new[e] = x[e] - move for all e.
+            # ocp[e] / l_mid ≤ x[e] - move when l_mid ≥ ocp[e] / (x[e] - move).
+            # Worst case is max(ocp) / rho_min (since x ≥ rho_min and move < rho_min
+            # is impossible by config). Guaranteed vol(x_new) < VF at l2.
+            ocp_max = ocp[design_mask].max() if design_mask.any() else 1.0
+            l2   = ocp_max / (config.rho_min + 1e-30)
             move = config.move
 
             for _ in range(200):
