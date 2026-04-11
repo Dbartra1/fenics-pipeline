@@ -1,12 +1,11 @@
 // src/main.rs
-//
-// Smoke harness for types.rs — run with `cargo run`.
-// This file will be replaced by the full CLI entry point (reads problem.json,
-// calls run_simp(), writes outputs) once the solver modules are built.
+#![allow(dead_code)]
 
 mod types;
+mod connectivity;
 
 use types::{Grid, Material, SimpConfig, RHO_MIN};
+use connectivity::{precompute_connectivity, precompute_dof_map};
 
 fn main() {
     // ── Handoff §11 exact assertions ─────────────────────────────────────────
@@ -23,15 +22,15 @@ fn main() {
     assert_eq!(grid.elem_idx(0, 0, 0), 0);
     assert_eq!(grid.elem_idx(grid.nx - 1, grid.ny - 1, grid.nz - 1), grid.n_elem() - 1);
 
-    // ── Stride checks (same as unit tests, but visible in terminal) ───────────
-    assert_eq!(grid.node_idx(1, 0, 0) - grid.node_idx(0, 0, 0), 1,        "x stride");
-    assert_eq!(grid.node_idx(0, 1, 0) - grid.node_idx(0, 0, 0), 11,       "y stride");
-    assert_eq!(grid.node_idx(0, 0, 1) - grid.node_idx(0, 0, 0), 11 * 7,   "z stride");
+    // ── Stride checks ─────────────────────────────────────────────────────────
+    assert_eq!(grid.node_idx(1, 0, 0) - grid.node_idx(0, 0, 0), 1,      "x stride");
+    assert_eq!(grid.node_idx(0, 1, 0) - grid.node_idx(0, 0, 0), 11,     "y stride");
+    assert_eq!(grid.node_idx(0, 0, 1) - grid.node_idx(0, 0, 0), 11 * 7, "z stride");
 
     // ── Material ──────────────────────────────────────────────────────────────
     let steel = Material { young: 210e9, poisson: 0.3 };
-    println!("λ (steel): {:.4e} Pa", steel.lame_lambda());  // ~1.2115e11
-    println!("μ (steel): {:.4e} Pa", steel.lame_mu());      // ~8.0769e10
+    println!("λ (steel): {:.4e} Pa", steel.lame_lambda());
+    println!("μ (steel): {:.4e} Pa", steel.lame_mu());
 
     // ── SimpConfig rho_min ────────────────────────────────────────────────────
     let cfg = SimpConfig {
@@ -39,9 +38,15 @@ fn main() {
         max_iterations: 200,   convergence_tol: 0.002,
         move_limit: 0.05,      damping: 0.5, checkpoint_every: 10,
     };
-    assert!(cfg.validate().is_ok(), "baseline config should be valid");
+    assert!(cfg.validate().is_ok());
     assert_eq!(cfg.rho_min(), RHO_MIN);
-    println!("rho_min:  {}", cfg.rho_min());   // 0.001
+    println!("rho_min:  {}", cfg.rho_min());
 
-    println!("\n✓ All types.rs smoke checks passed.");
+    // ── Connectivity smoke check ───────────────────────────────────────────────
+    let conn    = precompute_connectivity(&grid);
+    let dof_map = precompute_dof_map(&grid);
+    println!("Connectivity: {} elements, first elem nodes: {:?}", conn.len(), conn[0]);
+    println!("DOF map:      {} elements, first elem dofs:  {:?}", dof_map.len(), dof_map[0]);
+
+    println!("\n✓ All smoke checks passed.");
 }
