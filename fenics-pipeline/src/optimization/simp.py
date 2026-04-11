@@ -8,7 +8,7 @@
 # - LinearProblem built ONCE outside the loop (no JIT recompilation per iteration)
 # - rho is a dolfinx Function updated in-place each iteration
 # - Sensitivity filter applied to raw sensitivities (not density)
-# - OC bisection uses adaptive bounds [0, ocp.sum()] not fixed [1e-9, 1e9]
+# - OC bisection uses tight upper bound [0, max(ocp)/rho_min] not fixed [1e-9, 1e9]
 # - Cell volumes computed via vector assembly (accurate, no tet geometry hacks)
 # - Coordinate auto-detection: mm vs m
 
