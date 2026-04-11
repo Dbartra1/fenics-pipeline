@@ -196,6 +196,7 @@ def generate_opt_domain(
     gmsh.option.setNumber("Mesh.Algorithm3D", 1)  # Delaunay
     gmsh.model.mesh.generate(3)
     gmsh.model.mesh.optimize("Netgen")
+    gmsh.model.mesh.optimize("")   # Laplacian pass — improves aspect ratios post-Netgen
 
     msh_path = str(Path(output_dir) / "opt_domain.msh")
     gmsh.write(msh_path)
