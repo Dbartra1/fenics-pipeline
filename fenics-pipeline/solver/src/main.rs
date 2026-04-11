@@ -4,10 +4,12 @@
 mod types;
 mod connectivity;
 mod ke_base;
+mod filter;
 
 use types::{Grid, Material, SimpConfig, RHO_MIN};
 use connectivity::{precompute_connectivity, precompute_dof_map};
 use ke_base::compute_ke_base;
+use filter::build_filter;
 
 fn main() {
     // ── types smoke ───────────────────────────────────────────────────────────
@@ -39,9 +41,15 @@ fn main() {
     let ke = compute_ke_base(&steel, grid.voxel_size);
     let trace: f64 = (0..24).map(|i| ke[i * 24 + i]).sum();
     let ke_max = ke.iter().cloned().fold(0.0f64, f64::max);
-    println!("Ke trace:   {trace:.6e}  max entry: {ke_max:.6e}");
-    // Symmetry spot-check
-    assert!((ke[1*24+0] - ke[0*24+1]).abs() < 1e-6 * ke_max, "Ke symmetry failed");
+    println!("Ke trace: {trace:.6e}  max entry: {ke_max:.6e}");
+    assert!((ke[1*24+0] - ke[0*24+1]).abs() < 1e-6 * ke_max);
+
+    // ── filter smoke ──────────────────────────────────────────────────────────
+    let fw = build_filter(&grid, cfg.filter_radius);
+    println!(
+        "Filter: elem 0 has {} neighbours, weight_sum={:.4e}",
+        fw.weights[0].len(), fw.weight_sums[0]
+    );
 
     println!("\n✓ All smoke checks passed.");
 }
