@@ -62,7 +62,7 @@ pub fn cg_solve_direct(
     let mut r: Vec<f64> = f.iter().zip(ku.iter()).map(|(fi, ki)| fi - ki).collect();
 
     // ── z = M⁻¹·r ────────────────────────────────────────────────────────────
-    let mut z: Vec<f64> = r.iter().zip(diag.iter()).map(|(ri, di)| ri / di).collect();
+    let z: Vec<f64> = r.iter().zip(diag.iter()).map(|(ri, di)| ri / di).collect();
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
 
@@ -98,7 +98,6 @@ pub fn cg_solve_direct(
             p[i] = z_new[i] + beta * p[i];
         }
 
-        z  = z_new;
         rz = rz_new;
     }
 
