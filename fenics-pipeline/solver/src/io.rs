@@ -219,4 +219,5 @@ pub struct SolveResult {
     pub volume_history:     Vec<f64>,
     pub duration_s:         f64,
     pub peak_memory_mb:     f64,
+    pub final_density:      Vec<f64>,   // ← add this line
 }

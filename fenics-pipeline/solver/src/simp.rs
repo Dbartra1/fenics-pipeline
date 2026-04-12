@@ -17,7 +17,7 @@
 
 use std::time::Instant;
 
-use crate::assembly::{apply_dirichlet, assemble_k, build_csr_pattern, csr_matvec};
+use crate::assembly::{apply_dirichlet, assemble_k, build_csr_pattern};
 use crate::connectivity::{precompute_connectivity, precompute_dof_map};
 use crate::filter::build_filter;
 use crate::io::SolveResult;
@@ -168,7 +168,8 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
         compliance_history,
         volume_history,
         duration_s,
-        peak_memory_mb: 0.0,   // populated later if needed
+        peak_memory_mb: 0.0,
+        final_density: x,   // ← add this line
     }
 }
 
@@ -182,7 +183,7 @@ mod tests {
     fn make_problem(nx: usize, ny: usize, nz: usize) -> Problem {
         let g = Grid { nx, ny, nz, voxel_size: 0.001 };
         let n_elem = g.n_elem();
-        let n_dof  = g.n_dof();
+        let _n_dof = g.n_dof();
 
         // Bottom face fixed, top face loaded in -z
         let fixed_dofs: Vec<usize> = {

@@ -49,12 +49,7 @@ fn main() {
     let result = run_simp(&problem);
 
     // Write outputs
-    if let Err(e) = write_density(&out_dir.join("density.bin"), &{
-        // Reconstruct final density from result — re-run one more OC step
-        // would be wrong; instead we need to return x from run_simp.
-        // For now write a placeholder — this is fixed in python-integration.
-        vec![problem.config.volume_fraction; problem.grid.n_elem()]
-    }) {
+    if let Err(e) = write_density(&out_dir.join("density.bin"), &result.final_density) {
         eprintln!("Error writing density.bin: {e}"); std::process::exit(1);
     }
 
