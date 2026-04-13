@@ -104,7 +104,7 @@ pub fn build_csr_pattern(grid: &Grid, dof_map: &[[usize; 24]]) -> CsrPattern {
 /// k_vals must be pre-allocated to nnz = k_rows[n_dof] entries.
 /// It is zeroed at the start of this function — call once per iteration.
 ///
-/// void_mask[e]=true  → element contributes nothing (always void)
+/// void_mask[e]=true  → element uses ρ_min (prevents K singularity at hole nodes)
 /// nondesign[e]=true  → element uses ρ=1 regardless of x[e]
 pub fn assemble_k(
     k_vals:     &mut Vec<f64>,
@@ -115,12 +115,19 @@ pub fn assemble_k(
     nondesign:  &[bool],
     penal:      f64,
 ) {
+    use crate::types::RHO_MIN;
+
     // Zero k_vals — cheaper than re-allocating
     k_vals.iter_mut().for_each(|v| *v = 0.0);
 
     for e in 0..x.len() {
-        if void_mask[e] { continue; }
-        let rho   = if nondesign[e] { 1.0 } else { x[e] };
+        let rho = if void_mask[e] {
+            RHO_MIN   // prevents K singularity at nodes surrounded by void elements
+        } else if nondesign[e] {
+            1.0
+        } else {
+            x[e]
+        };
         let scale = rho.powf(penal);
         for i in 0..24 {
             for j in 0..24 {
@@ -144,6 +151,9 @@ pub fn apply_dirichlet(
     fixed_dofs: &[usize],
     diag_value: f64,
 ) {
+    use std::collections::HashSet;
+    // O(n_fixed) build once; avoids O(n_fixed) scan per nonzero in the column pass.
+    let fixed_set: HashSet<usize> = fixed_dofs.iter().copied().collect();
     let n_dof = k_rows.len() - 1;
 
     // Zero all entries in fixed rows
@@ -153,12 +163,10 @@ pub fn apply_dirichlet(
         }
     }
 
-    // Zero all entries in fixed columns (requires a scan — unavoidable in CSR)
-    // and set diagonal to diag_value
+    // Zero all entries in fixed columns — O(nnz) with O(1) lookup per entry
     for row in 0..n_dof {
         for pos in k_rows[row]..k_rows[row + 1] {
-            let col = k_cols[pos];
-            if fixed_dofs.contains(&col) {
+            if fixed_set.contains(&k_cols[pos]) {
                 k_vals[pos] = 0.0;
             }
         }

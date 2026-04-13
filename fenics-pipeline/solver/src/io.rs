@@ -209,6 +209,11 @@ pub fn write_result(path: &Path, result: &SolveResult) -> Result<(), String> {
 }
 
 /// The result written to result.json.
+///
+/// `final_density` is excluded from JSON serialization: at 120k elements it
+/// would embed ~3MB of float text into result.json which the notebook never
+/// reads (it reads density.bin directly via np.fromfile). The field exists
+/// on the struct so main.rs can call write_density() with it.
 #[derive(serde::Serialize)]
 pub struct SolveResult {
     pub converged:          bool,
@@ -219,5 +224,6 @@ pub struct SolveResult {
     pub volume_history:     Vec<f64>,
     pub duration_s:         f64,
     pub peak_memory_mb:     f64,
-    pub final_density:      Vec<f64>,   // ← add this line
+    #[serde(skip)]
+    pub final_density:      Vec<f64>,
 }
