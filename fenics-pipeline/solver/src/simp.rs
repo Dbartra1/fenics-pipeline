@@ -102,11 +102,11 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
         let elapsed    = start.elapsed().as_secs_f64();
         compliance_history.push(compliance);
         volume_history.push(vol_frac);
-        
+
+        let elapsed = start.elapsed().as_secs_f64();
         println!(
-            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | CG={:4} | res={:.1e} | {:.1}s{}",
-            n_iterations, compliance, vol_frac, rho_change, cfg.penal,
-            solve.iterations, solve.rel_residual, elapsed,
+            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | {:.1}s{}",
+            n_iterations, compliance, vol_frac, rho_change, cfg.penal, elapsed,
             if solve.converged { "" } else { " [SOLVE!]" }
         );
 
