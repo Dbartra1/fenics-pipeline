@@ -277,11 +277,12 @@ impl Problem {
                     n
                 ));
             }
+            // Allow 0.0 for void elements — clamped to RHO_MIN in run_simp()
             for (i, &v) in xi.iter().enumerate() {
-                if !(RHO_MIN..=1.0).contains(&v) {
+                if !(0.0..=1.0).contains(&v) {
                     return Err(format!(
-                        "x_init[{}]={} out of range [{}, 1.0]",
-                        i, v, RHO_MIN
+                        "x_init[{}]={} out of range [0.0, 1.0]",
+                        i, v, 
                     ));
                 }
             }
