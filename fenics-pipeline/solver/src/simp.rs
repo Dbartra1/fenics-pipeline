@@ -99,14 +99,14 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
         let oc = oc_update(&x, &dc, cfg, void_mask, nondesign);
         let rho_change = oc.rho_change;
         let vol_frac   = oc.vol_frac;
-
+        let elapsed    = start.elapsed().as_secs_f64();
         compliance_history.push(compliance);
         volume_history.push(vol_frac);
-
-        let elapsed = start.elapsed().as_secs_f64();
+        
         println!(
-            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | {:.1}s{}",
-            n_iterations, compliance, vol_frac, rho_change, cfg.penal, elapsed,
+            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | CG={:4} | res={:.1e} | {:.1}s{}",
+            n_iterations, compliance, vol_frac, rho_change, cfg.penal,
+            solve.iterations, solve.rel_residual, elapsed,
             if solve.converged { "" } else { " [SOLVE!]" }
         );
 
@@ -121,8 +121,9 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
             let c_max = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let c_min = recent.iter().cloned().fold(f64::INFINITY,     f64::min);
             let spread = (c_max - c_min) / (c_max.abs() + 1e-30);
-            if spread < 1e-4 {
-                println!("✓ Compliance flat (spread={spread:.2e}) — converged at iteration {n_iterations}");
+            if spread < cfg.convergence_tol {
+                println!("✓ Compliance flat (spread={spread:.2e} < tol={}) — converged at iteration {n_iterations}",
+                         cfg.convergence_tol);
                 converged = true;
                 break;
             }

@@ -29,9 +29,6 @@
 //
 // If the API names below don't compile, check the items marked VERIFY.
 
-use faer::sparse::{SparseColMat, linalg::solvers::Cholesky}; // VERIFY: module path
-use faer::Mat;
-
 /// Result returned by `cg_solve_direct` — kept identical so simp.rs is unchanged.
 #[derive(Debug)]
 pub struct CgResult {
@@ -59,19 +56,27 @@ pub fn cg_solve_direct(
     _tol:     f64,
     _max_iter: usize,
 ) -> CgResult {
-    match cholesky_solve(k_rows, k_cols, k_vals, f, u) {
-        Ok(rel_res) => CgResult {
-            iterations:   1,
-            rel_residual: rel_res,
-            converged:    true,
-        },
-        Err(e) => {
-            // Cholesky failed (K not SPD — likely a degenerate density field
-            // or a Dirichlet BC application error).  Fall back to CG so the
-            // SIMP loop can continue degraded rather than panic.
-            eprintln!("[solver] Cholesky failed ({e}), falling back to CG (tol=1e-4, 5000 iter)");
-            cg_solve_inner(k_rows, k_cols, k_vals, f, u, 1e-4, 5000)
+    // Cholesky fill-in on 3D hex meshes makes it slower than CG above ~50k DOFs.
+    // Use Cholesky for dev grid, parallel CG for production.
+    if f.len() < 50_000 {
+        match cholesky_solve(k_rows, k_cols, k_vals, f, u) {
+            Ok(rel_res) => CgResult { iterations: 1, rel_residual: rel_res, converged: true },
+            Err(e) => {
+                eprintln!("[solver] Cholesky failed ({e}), falling back to CG");
+                cg_solve_inner(k_rows, k_cols, k_vals, f, u, 1e-6, f.len())
+            }
         }
+    } else {
+        // ── GPU path (compiled only with --features gpu) ──────────────────
+        #[cfg(feature = "gpu")]
+        {
+            use crate::gpu_solver::GpuK;
+            match GpuK::upload(k_rows, k_cols, k_vals) {
+                Ok(gpu_k) => return gpu_cg_solve(&gpu_k, f, u, 1e-6, f.len()),
+                Err(e)    => eprintln!("[gpu] upload failed: {e} — falling back to CPU CG"),
+            }
+        }
+        cg_solve_inner(k_rows, k_cols, k_vals, f, u, 1e-6, f.len())
     }
 }
 
@@ -92,66 +97,40 @@ fn cholesky_solve(
     f:      &[f64],
     u:      &mut [f64],
 ) -> Result<f64, String> {
+    use faer::sparse::{
+        SparseColMat, SymbolicSparseColMat,
+        linalg::solvers::{Cholesky, SymbolicCholesky},
+    };
+    use faer::Side;
+    use faer::prelude::SpSolver;
+
     let n = f.len();
 
-    // ── Index type conversion ──────────────────────────────────────────────
-    // VERIFY: faer 0.19 SparseColMat index type.
-    // Try `i32` first. If the compiler complains about Index not being
-    // implemented for i32, try `usize`. The faer::sparse::Index trait
-    // documents which primitive types are supported.
-    let col_ptrs: Vec<i32> = k_rows.iter()
-        .map(|&x| x as i32)
-        .collect();
-    let row_idxs: Vec<i32> = k_cols.iter()
-        .map(|&x| x as i32)
-        .collect();
+    // K is symmetric so CSR == CSC: k_rows are col_ptrs, k_cols are row_idxs
+    let symbolic = SymbolicSparseColMat::<usize>::new_unsorted_checked(
+        n, n,
+        k_rows.to_vec(),
+        None,
+        k_cols.to_vec(),
+    );
 
-    // ── Sparse matrix construction ─────────────────────────────────────────
-    // VERIFY: constructor name in faer 0.19 sparse docs.
-    // The CSR rows are sorted by column index (guaranteed by build_csr_pattern),
-    // which means when interpreted as CSC, each column's row indices are sorted.
-    // This satisfies the "sorted" precondition.
-    //
-    // Candidate names to check in docs (most likely first):
-    //   SparseColMat::try_new_from_col_major_sorted
-    //   SparseColMat::new_from_col_major
-    //   SparseColMat::try_new_from_csc
-    let mat = SparseColMat::<i32, f64>::try_new_from_col_major_sorted( // VERIFY
-        n,
-        n,
-        col_ptrs.as_slice(),
-        row_idxs.as_slice(),
-        k_vals,
-    ).map_err(|e| format!("SparseColMat construction failed: {:?}", e))?;
+    let mat = SparseColMat::<usize, f64>::new(symbolic, k_vals.to_vec());
 
-    // ── Cholesky factorization ─────────────────────────────────────────────
-    // VERIFY: Cholesky::try_new signature.
-    // In some faer 0.19 builds it takes (mat, side) where side is
-    // faer::Side::Lower. In others it infers the triangle automatically.
-    // Try without Side argument first; add `faer::Side::Lower` if it
-    // doesn't compile.
-    //
-    //   Option A: Cholesky::try_new(mat.as_ref())
-    //   Option B: Cholesky::try_new(mat.as_ref(), faer::Side::Lower)
-    let chol = Cholesky::try_new(mat.as_ref()) // VERIFY option A or B above
-        .map_err(|e| format!("Cholesky factorization failed: {:?}", e))?;
+    let symbolic_chol = SymbolicCholesky::try_new(mat.symbolic(), Side::Lower)
+    .map_err(|e| { eprintln!("[chol] symbolic failed: {:?}", e); format!("{:?}", e) })?;
 
-    // ── Back-solve ─────────────────────────────────────────────────────────
-    // VERIFY: faer 0.19 back-solve API.
-    // Most likely: chol.solve_in_place(rhs.as_mut())  where rhs is a Col or Mat.
-    // Alternative: chol.solve_mut(&mut rhs) or similar.
-    let mut rhs = Mat::<f64>::from_fn(n, 1, |i, _| f[i]);
-    chol.solve_in_place(rhs.as_mut()); // VERIFY method name
+    let chol = Cholesky::try_new_with_symbolic(symbolic_chol, mat.as_ref(), Side::Lower)
+    .map_err(|e| { eprintln!("[chol] numeric failed: {:?}", e); format!("{:?}", e) })?;
 
-    // Extract solution
-    for i in 0..n {
-        u[i] = rhs.read(i, 0);
-    }
+    let mut rhs = faer::Mat::<f64>::from_fn(n, 1, |i, _| f[i]);
+    chol.solve_in_place(rhs.as_mut());
 
-    // ── Residual (diagnostic) ──────────────────────────────────────────────
+    for i in 0..n { u[i] = rhs.read(i, 0); }
+
     let f_norm = dot(f, f).sqrt().max(1e-30);
     let ku = csr_matvec_local(k_rows, k_cols, k_vals, u);
-    let res_norm = ku.iter().zip(f.iter()).map(|(ki, fi)| (ki - fi).powi(2)).sum::<f64>().sqrt();
+    let res_norm = ku.iter().zip(f.iter())
+        .map(|(ki, fi)| (ki - fi).powi(2)).sum::<f64>().sqrt();
     Ok(res_norm / f_norm)
 }
 
@@ -229,6 +208,91 @@ pub fn cg_solve_inner(
     }
 }
 
+// ─── GPU-accelerated CG (compiled only with --features gpu) ──────────────────
+
+/// ILU(0)-preconditioned CG using GPU SpMV + GPU triangular solves.
+///
+/// Per CG iteration:
+///   1. kp = K·p       — GPU SpMV via gpu_k.matvec()
+///   2. z  = M⁻¹·r     — GPU fwd/bwd triangular solves via gpu_k.precondition()
+///
+/// Falls back to Jacobi on preconditioner error (triangular solve failure
+/// indicates structural singularity in ILU factor — rare but possible when
+/// ρ_min elements produce near-zero pivots).
+#[cfg(feature = "gpu")]
+fn gpu_cg_solve(
+    gpu_k:    &crate::gpu_solver::GpuK,
+    f:        &[f64],
+    u:        &mut [f64],
+    tol:      f64,
+    max_iter: usize,
+) -> CgResult {
+    let n      = f.len();
+    let f_norm = dot(f, f).sqrt().max(1e-30);
+    let diag   = &gpu_k.diag;   // Jacobi diagonal — fallback only
+
+    // Zero u — GPU CG accumulates updates in-place (u += α·p each step).
+    // Without this, reusing u from the previous SIMP iteration corrupts the
+    // solution: u_final = u_prev + u_correct instead of u_correct.
+    // Cholesky overwrites u entirely; CPU CG computes r = f - K·u to handle
+    // warm starts. GPU CG must start from u = 0.
+    for v in u.iter_mut() { *v = 0.0; }
+    let mut r  = f.to_vec();
+    let mut z  = vec![0.0_f64; n];
+    let mut kp = vec![0.0_f64; n];
+
+    // First preconditioner application: z = M⁻¹·r
+    let use_ilu = gpu_k.precondition(&r, &mut z).is_ok();
+    if !use_ilu {
+        eprintln!("[gpu] ILU precondition failed on iter 0, falling back to Jacobi");
+        for i in 0..n { z[i] = r[i] / diag[i]; }
+    }
+
+    let mut p  = z.clone();
+    let mut rz = dot(&r, &z);
+
+    let mut iterations   = 0;
+    let mut rel_residual = dot(&r, &r).sqrt() / f_norm;
+
+    for iter in 0..max_iter {
+        iterations   = iter + 1;
+        rel_residual = dot(&r, &r).sqrt() / f_norm;
+        if rel_residual < tol { break; }
+
+        // SpMV: kp = K·p
+        if let Err(e) = gpu_k.matvec(&p, &mut kp) {
+            eprintln!("[gpu] matvec iter {iter}: {e}");
+            return CgResult { iterations: iter, rel_residual: f64::INFINITY, converged: false };
+        }
+
+        let pkp = dot(&p, &kp);
+        if pkp.abs() < 1e-30 { break; }
+        let alpha = rz / pkp;
+
+        for i in 0..n {
+            u[i] += alpha * p[i];
+            r[i] -= alpha * kp[i];
+        }
+
+        // Preconditioner: z = M⁻¹·r  (ILU or Jacobi fallback)
+        if use_ilu {
+            if let Err(e) = gpu_k.precondition(&r, &mut z) {
+                eprintln!("[gpu] ILU precondition failed iter {iter}: {e}");
+                for i in 0..n { z[i] = r[i] / diag[i]; }
+            }
+        } else {
+            for i in 0..n { z[i] = r[i] / diag[i]; }
+        }
+
+        let rz_new = dot(&r, &z);
+        let beta   = rz_new / rz.max(1e-30);
+        for i in 0..n { p[i] = z[i] + beta * p[i]; }
+        rz = rz_new;
+    }
+
+    CgResult { iterations, rel_residual, converged: rel_residual < tol }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 #[inline]
@@ -242,14 +306,13 @@ fn csr_matvec_local(
     k_vals: &[f64],
     u:      &[f64],
 ) -> Vec<f64> {
+    use rayon::prelude::*;
     let n = k_rows.len() - 1;
-    let mut f = vec![0.0f64; n];
-    for i in 0..n {
-        for pos in k_rows[i]..k_rows[i + 1] {
-            f[i] += k_vals[pos] * u[k_cols[pos]];
-        }
-    }
-    f
+    (0..n).into_par_iter().map(|i| {
+        (k_rows[i]..k_rows[i + 1])
+            .map(|pos| k_vals[pos] * u[k_cols[pos]])
+            .sum()
+    }).collect()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -383,19 +446,19 @@ mod tests {
         }
     }
 
-    // ── Cholesky integration test (requires sparse feature) ───────────────
-    // Uncomment after confirming faer sparse feature compiles.
-    //
-    // #[test]
-    // fn cholesky_solves_tridiagonal_system() {
-    //     let (k_rows, k_cols, k_vals, f) = tridiag_system();
-    //     let mut u = [0.0f64; 3];
-    //     let result = cg_solve_direct(&k_rows, &k_cols, &k_vals, &f, &mut u, 0.0, 0);
-    //     assert!(result.converged, "Cholesky did not report success");
-    //     let expected = [2.0/7.0, 1.0/7.0, 2.0/7.0];
-    //     for i in 0..3 {
-    //         let err = (u[i] - expected[i]).abs();
-    //         assert!(err < 1e-10, "u[{i}]={:.8e}, expected {:.8e}", u[i], expected[i]);
-    //     }
-    // }
+     //── Cholesky integration test (requires sparse feature) ───────────────
+     //Uncomment after confirming faer sparse feature compiles.
+    
+     #[test]
+     fn cholesky_solves_tridiagonal_system() {
+         let (k_rows, k_cols, k_vals, f) = tridiag_system();
+         let mut u = [0.0f64; 3];
+         let result = cg_solve_direct(&k_rows, &k_cols, &k_vals, &f, &mut u, 0.0, 0);
+         assert!(result.converged, "Cholesky did not report success");
+         let expected = [2.0/7.0, 1.0/7.0, 2.0/7.0];
+         for i in 0..3 {
+             let err = (u[i] - expected[i]).abs();
+             assert!(err < 1e-10, "u[{i}]={:.8e}, expected {:.8e}", u[i], expected[i]);
+         }
+     }
 }

@@ -17,6 +17,9 @@ mod simp;
 mod solver;
 mod types;
 
+#[cfg(feature = "gpu")]
+mod gpu_solver;
+
 use std::path::Path;
 use io::{load_problem, write_density, write_result};
 use simp::run_simp;

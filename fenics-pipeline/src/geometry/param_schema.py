@@ -3,33 +3,56 @@
 # Typed schema for pipeline parameters.
 # Validates params.json at load time so bad values fail here,
 # not mid-solve in 03_fea_fenicsx.ipynb.
+#
+# Phase 1: GeometryParams now accepts arbitrary extra fields and passes
+#           them all through to OpenSCAD as -D defines.
+# Phase 2: load_case_config drives face selection in voxelize.py,
+#           nondesign_regions drives void/nondesign mask generation.
+#           Both fall back to legacy behavior if absent.
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import json
 from pathlib import Path
 
 
-@dataclass
 class GeometryParams:
-    length:                 float
-    width:                  float
-    height:                 float
-    wall_thickness:         float
-    fillet_radius:          float
-    mounting_hole_diameter: float
-    mounting_hole_inset:    float
+    """
+    Geometry parameters for a part.
+
+    Required: length, width, height  (used to compute voxel grid dimensions)
+    Optional: any additional fields — stored as attributes and passed
+              through to OpenSCAD as uppercase -D defines.
+
+    This design allows arbitrary SCAD files without modifying this class.
+    """
+    def __init__(self, length: float, width: float, height: float, **kwargs):
+        self.length = float(length)
+        self.width  = float(width)
+        self.height = float(height)
+        # Store extra fields as attributes (e.g. wall_thickness, fillet_radius)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        # Keep a full dict for OpenSCAD define generation
+        self._all_fields: Dict[str, Any] = {
+            "length": self.length,
+            "width":  self.width,
+            "height": self.height,
+            **kwargs,
+        }
+
+    def get(self, key: str, default=None):
+        """Safe attribute access with default — used by voxelize.py."""
+        return getattr(self, key, default)
 
     def validate(self) -> None:
-        assert self.length > 0,                             "length must be > 0"
-        assert self.width > 0,                              "width must be > 0"
-        assert self.height > 0,                             "height must be > 0"
-        assert self.wall_thickness < min(self.length, self.width) / 2, \
-            "wall_thickness too large for given length/width"
-        assert self.fillet_radius <= self.wall_thickness, \
-            "fillet_radius must be <= wall_thickness"
-        assert self.mounting_hole_diameter < self.width, \
-            "mounting_hole_diameter must be < width"
+        assert self.length > 0, "length must be > 0"
+        assert self.width  > 0, "width must be > 0"
+        assert self.height > 0, "height must be > 0"
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{k}={v}" for k, v in self._all_fields.items())
+        return f"GeometryParams({fields})"
 
 
 @dataclass
@@ -48,28 +71,8 @@ class MeshHints:
 class BoundaryConditions:
     """
     Describes how the part is fixed and loaded for FEA and topology optimization.
-
-    fixed_face:
-        Which face is fully fixed (encastre), OR "corners" to fix only the
-        corner mounting-hole regions on that face.
-        Face names: "top" (+Z), "bottom" (-Z), "left" (-X), "right" (+X),
-                    "front" (-Y), "back" (+Y), "corners" (corner regions on bottom)
-
-    load_face:
-        Which face the traction load is applied to.
-        Same face names as above, excluding "corners".
-
-    load_direction:
-        [x, y, z] vector for load direction. Will be normalized internally.
-        Default [0, 0, -1] = downward (-Z).
-
-    hole_inset_fraction:
-        When fixed_face="corners", the fraction of part length/width used as
-        the corner region size. 0.15 = 15% inset matches a typical 4-hole bracket.
-
-    shell_thickness_mm:
-        Enforce a solid outer shell of this thickness (mm) in Stage 5 STL export.
-        Prevents open surfaces at part boundaries. Set to 0 to disable.
+    Kept for backward compatibility with Stage 03 (FEniCSx path).
+    For the Rust solver path, use load_case_config instead.
     """
     fixed_face:           str   = "corners"
     load_face:            str   = "top"
@@ -95,7 +98,186 @@ class BoundaryConditions:
 
 
 @dataclass
+class FixedFaceConfig:
+    """
+    Declarative fixed BC specification for the Rust solver path.
+
+    face:           which face to fix — "x_min","x_max","y_min","y_max","z_min","z_max"
+    selector:       "full"      → fix all nodes on that face
+                    "corners"   → fix disks at the 4 face-bbox corners
+                                  (intended for rectangular parts)
+                    "leg_holes" → fix N disks at leg-hole positions on a disk
+                                  shape. N, radius, and first angle are read
+                                  from the geometry dict:
+                                      geometry.num_legs         (default 3)
+                                      geometry.leg_hole_radius  (mm, required)
+                                      geometry.first_leg_angle  (deg, default 90)
+                                  The disk pattern is laid out about the part's
+                                  XY centre (see region_factory.part_center_m).
+    inset_m:        corner inset distance in metres (selector="corners" only)
+    disk_radius_m:  radius of each fixed disk in metres (used by BOTH
+                    "corners" and "leg_holes"; typically leg_hole_d/2 +
+                    ~1–2 mm clearance so the fixed region contains the full
+                    bolt-shank contact patch).
+    """
+    face:           str   = "z_min"
+    selector:       str   = "corners"
+    inset_m:        float = 0.010
+    disk_radius_m:  float = 0.005
+
+    VALID_FACES     = {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}
+    VALID_SELECTORS = {"full", "corners", "leg_holes"}
+
+    def validate(self) -> None:
+        assert self.face in self.VALID_FACES, \
+            f"fixed face must be one of {self.VALID_FACES}, got '{self.face}'"
+        assert self.selector in self.VALID_SELECTORS, \
+            f"selector must be one of {self.VALID_SELECTORS}, got '{self.selector}'"
+        assert self.inset_m > 0, "inset_m must be > 0"
+        assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
+
+@dataclass
+class LoadFaceConfig:
+    """
+    Declarative load specification for the Rust solver path.
+
+    face:          which face receives the traction load
+    selector:      "full"        → distribute load uniformly across the
+                                   entire face (legacy / default behaviour)
+                   "center_disk" → concentrate load on a central disk patch.
+                                   The XY centre of the disk is resolved per
+                                   part shape via region_factory.part_center_m:
+                                     shape="disk" → (diameter/2, diameter/2)
+                                     shape="box" / absent → (length/2, width/2)
+                                   Use this when the physical load path runs
+                                   through a specific mounting feature (e.g.
+                                   the central bolt of a tripod mount) rather
+                                   than the entire face.
+    direction:     [x, y, z] unit vector (will be normalised internally)
+    magnitude_n:   total force in Newtons, distributed across the selected DOFs
+    disk_radius_m: radius of the loaded disk in metres (selector="center_disk"
+                   only). Size this to match the real contact patch — too
+                   small approaches a point load and produces stress
+                   singularities that dominate SIMP convergence.
+    """
+    face:          str   = "z_max"
+    selector:      str   = "full"
+    direction:     List  = field(default_factory=lambda: [0.0, 0.0, -1.0])
+    magnitude_n:   float = 10000.0
+    disk_radius_m: float = 0.010
+
+    VALID_FACES     = {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}
+    VALID_SELECTORS = {"full", "center_disk"}
+
+    def validate(self) -> None:
+        assert self.face in self.VALID_FACES, \
+            f"load face must be one of {self.VALID_FACES}, got '{self.face}'"
+        assert self.selector in self.VALID_SELECTORS, \
+            f"selector must be one of {self.VALID_SELECTORS}, got '{self.selector}'"
+        assert len(self.direction) == 3, "direction must be [x, y, z]"
+        assert self.magnitude_n > 0, "magnitude_n must be > 0"
+        assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
+
+@dataclass
+class LoadCaseConfig:
+    """
+    Full load case: fixed BCs + applied load.
+    Replaces the hardcoded logic in build_load_case().
+    """
+    fixed: FixedFaceConfig = field(default_factory=FixedFaceConfig)
+    load:  LoadFaceConfig  = field(default_factory=LoadFaceConfig)
+
+    def validate(self) -> None:
+        self.fixed.validate()
+        self.load.validate()
+        assert self.fixed.face != self.load.face, \
+            "fixed face and load face cannot be the same"
+
+
+@dataclass
+class NondesignRegion:
+    """
+    A geometric region that is forced solid (nondesign) or void in the voxel grid.
+
+    type:           "cylinder_z" | "cylinder_x" | "cylinder_y"
+                    Cylinder axis determines which plane the center coords are in:
+                    cylinder_z → centers in (x, y), cylinder_x → (y, z), cylinder_y → (x, z)
+    centers_m:      list of [a, b] center coordinates in metres
+    void_radius_m:  radius of the always-void core (the actual hole)
+    wall_radius_m:  radius of the nondesign ring around the void (forced solid)
+                    Set equal to void_radius_m to have no ring.
+    """
+    type:          str
+    centers_m:     List
+    void_radius_m: float
+    wall_radius_m: float
+
+    VALID_TYPES = {"cylinder_z", "cylinder_x", "cylinder_y"}
+
+    def validate(self) -> None:
+        assert self.type in self.VALID_TYPES, \
+            f"type must be one of {self.VALID_TYPES}, got '{self.type}'"
+        assert self.void_radius_m > 0, "void_radius_m must be > 0"
+        assert self.wall_radius_m >= self.void_radius_m, \
+            "wall_radius_m must be >= void_radius_m"
+        assert len(self.centers_m) > 0, "centers_m must not be empty"
+        for c in self.centers_m:
+            assert len(c) == 2, "each center must be [a, b]"
+
+@dataclass
+class VoidRegion:
+    """
+    A region that is forced void in the voxel grid.
+
+    Supported types:
+      "box"                  — axis-aligned box; any of x/y/z_min/max may be
+                               omitted (treated as unbounded). All bounds in metres.
+      "cylinder_z_exterior"  — everything OUTSIDE a cylinder whose axis is parallel
+                               to z, useful for masking the empty space around
+                               circular parts (disks, rings) that sit in a
+                               rectangular voxel grid.
+                               Requires cx, cy, radius (metres).
+
+    Examples:
+        {"type": "box", "x_min": 0.020, "z_min": 0.020}
+        {"type": "cylinder_z_exterior", "cx": 0.040, "cy": 0.040, "radius": 0.040}
+    """
+    type:  str
+    # box fields
+    x_min: Optional[float] = None
+    x_max: Optional[float] = None
+    y_min: Optional[float] = None
+    y_max: Optional[float] = None
+    z_min: Optional[float] = None
+    z_max: Optional[float] = None
+    # cylinder_z_exterior fields
+    cx:     Optional[float] = None
+    cy:     Optional[float] = None
+    radius: Optional[float] = None
+
+    VALID_TYPES = {"box", "cylinder_z_exterior"}
+
+    def validate(self) -> None:
+        assert self.type in self.VALID_TYPES, \
+            f"VoidRegion type must be one of {self.VALID_TYPES}, got '{self.type}'"
+
+        if self.type == "box":
+            if self.x_min is not None and self.x_max is not None:
+                assert self.x_min <= self.x_max, "x_min must be <= x_max"
+            if self.y_min is not None and self.y_max is not None:
+                assert self.y_min <= self.y_max, "y_min must be <= y_max"
+            if self.z_min is not None and self.z_max is not None:
+                assert self.z_min <= self.z_max, "z_min must be <= z_max"
+
+        elif self.type == "cylinder_z_exterior":
+            assert self.cx is not None, "cylinder_z_exterior requires cx"
+            assert self.cy is not None, "cylinder_z_exterior requires cy"
+            assert self.radius is not None and self.radius > 0, \
+                "cylinder_z_exterior requires radius > 0"
+
+@dataclass
 class LoadHints:
+    """Kept for backward compatibility with Stage 03 FEniCSx path."""
     primary_face:     str
     load_magnitude_n: float
 
@@ -120,16 +302,27 @@ class PipelineParams:
     mesh_hints:           MeshHints
     load_hints:           LoadHints
     export:               ExportParams
-    boundary_conditions:  BoundaryConditions = field(
-        default_factory=BoundaryConditions
-    )
+    boundary_conditions:  BoundaryConditions    = field(default_factory=BoundaryConditions)
+    
+    # Phase 2: declarative load case and nondesign regions (optional)
+    load_case_config:     Optional[LoadCaseConfig]      = None
+    nondesign_regions:    List[NondesignRegion]          = field(default_factory=list)
+    
+    # Phase 3: axis-aligned box regions forced void (empty space in non-rectangular parts)
+    void_regions:         List[VoidRegion]               = field(default_factory=list)
 
     def validate(self) -> None:
-        """Run all sub-validators. Call this immediately after loading."""
+        """Run all sub-validators."""
         self.geometry.validate()
         self.mesh_hints.validate()
         self.load_hints.validate()
         self.boundary_conditions.validate()
+        if self.load_case_config is not None:
+            self.load_case_config.validate()
+        for r in self.nondesign_regions:
+            r.validate()
+        for r in self.void_regions:
+            r.validate()
 
     @classmethod
     def from_json(cls, path: str | Path) -> "PipelineParams":
@@ -139,15 +332,42 @@ class PipelineParams:
 
     @classmethod
     def from_dict(cls, raw: dict) -> "PipelineParams":
-        """Load params from a plain dict — used by generate_test_cases notebook."""
+        """Load params from a plain dict."""
         return cls._from_raw(raw)
 
     @classmethod
     def _from_raw(cls, raw: dict) -> "PipelineParams":
-        """Shared deserialization with backward-compatible BC loading.
-        If boundary_conditions is absent from params.json, sensible defaults apply.
+        """
+        Deserialize with backward compatibility.
+        New fields (load_case_config, nondesign_regions) are optional.
         """
         bc_raw = raw.get("boundary_conditions", {})
+
+        # Parse load_case_config if present
+        lc_raw = raw.get("load_case", None)
+        load_case_config = None
+        if lc_raw is not None:
+            fixed_raw = lc_raw.get("fixed", {})
+            load_raw  = lc_raw.get("load", {})
+            load_case_config = LoadCaseConfig(
+                fixed=FixedFaceConfig(**fixed_raw) if fixed_raw else FixedFaceConfig(),
+                load=LoadFaceConfig(**load_raw)    if load_raw  else LoadFaceConfig(),
+            )
+
+        # Parse nondesign_regions if present
+        nd_raw = raw.get("nondesign_regions", [])
+        nondesign_regions = [
+            NondesignRegion(**{k: v for k, v in r.items() if not k.startswith("_")})
+            for r in nd_raw
+        ]
+
+        # Parse void_regions if present (Phase 3)
+        vr_raw = raw.get("void_regions", [])
+        void_regions = [
+            VoidRegion(**{k: v for k, v in r.items() if not k.startswith("_")})
+            for r in vr_raw
+        ]
+
         return cls(
             part_name=raw["part_name"],
             geometry=GeometryParams(**raw["geometry"]),
@@ -156,20 +376,29 @@ class PipelineParams:
             export=ExportParams(**raw["export"]),
             boundary_conditions=BoundaryConditions(**bc_raw) if bc_raw
                                 else BoundaryConditions(),
+            load_case_config=load_case_config,
+            nondesign_regions=nondesign_regions,
+            void_regions=void_regions,
         )
 
-    def to_openscad_defines(self) -> dict[str, float | str | bool]:
+    def to_openscad_defines(self) -> dict:
         """
-        Flatten geometry params into a dict of OpenSCAD -D defines.
-        Only geometry values go to OpenSCAD — mesh/load hints are Python-only.
+        Flatten scalar-numeric geometry params into uppercase OpenSCAD -D defines.
+
+        Only int / float / bool fields are emitted. Non-numeric fields
+        (e.g. ``shape: "disk"``) are geometry-factory metadata consumed by
+        ``region_factory`` / ``resolve_geometry_regions`` — NOT OpenSCAD
+        variables. Passing them through as ``-D SHAPE="disk"`` pollutes
+        the SCAD namespace and risks collisions with module / function
+        identifiers in the .scad file.  Lists / dicts are filtered for
+        the same reason (``-D`` expects scalars).
+
+        Note: ``bool`` is a subclass of ``int`` in Python, so boolean
+        fields fall through and are handled by openscad_runner's
+        dedicated bool branch.
         """
-        g = self.geometry
         return {
-            "LENGTH":                 g.length,
-            "WIDTH":                  g.width,
-            "HEIGHT":                 g.height,
-            "WALL_THICKNESS":         g.wall_thickness,
-            "FILLET_RADIUS":          g.fillet_radius,
-            "MOUNTING_HOLE_DIAMETER": g.mounting_hole_diameter,
-            "MOUNTING_HOLE_INSET":    g.mounting_hole_inset,
+            k.upper(): v
+            for k, v in self.geometry._all_fields.items()
+            if isinstance(v, (int, float))
         }

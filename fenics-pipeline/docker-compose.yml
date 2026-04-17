@@ -25,6 +25,7 @@ services:
         target: /workspace/outputs
       # Persistent pip cache — survives rebuilds
       - pip-cache:/root/.cache/pip
+      - /usr/local/cuda-12.6:/usr/local/cuda-12.6:ro
 
     environment:
       # Must match --name flag in: python -m ipykernel install --name "fenics-pipeline"
@@ -43,6 +44,10 @@ services:
           memory: 16G
         reservations:
           memory: 4G
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
 
     # MPI inter-process comms use /dev/shm — default 64MB kills parallel FEA
     # Increase if 03_fea_fenicsx.ipynb hangs or OOMs on larger meshes
