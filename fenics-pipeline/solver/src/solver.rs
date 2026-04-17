@@ -229,6 +229,91 @@ pub fn cg_solve_inner(
     }
 }
 
+// ─── GPU-accelerated CG (compiled only with --features gpu) ──────────────────
+
+/// ILU(0)-preconditioned CG using GPU SpMV + GPU triangular solves.
+///
+/// Per CG iteration:
+///   1. kp = K·p       — GPU SpMV via gpu_k.matvec()
+///   2. z  = M⁻¹·r     — GPU fwd/bwd triangular solves via gpu_k.precondition()
+///
+/// Falls back to Jacobi on preconditioner error (triangular solve failure
+/// indicates structural singularity in ILU factor — rare but possible when
+/// ρ_min elements produce near-zero pivots).
+#[cfg(feature = "gpu")]
+fn gpu_cg_solve(
+    gpu_k:    &crate::gpu_solver::GpuK,
+    f:        &[f64],
+    u:        &mut [f64],
+    tol:      f64,
+    max_iter: usize,
+) -> CgResult {
+    let n      = f.len();
+    let f_norm = dot(f, f).sqrt().max(1e-30);
+    let diag   = &gpu_k.diag;   // Jacobi diagonal — fallback only
+
+    // Zero u — GPU CG accumulates updates in-place (u += α·p each step).
+    // Without this, reusing u from the previous SIMP iteration corrupts the
+    // solution: u_final = u_prev + u_correct instead of u_correct.
+    // Cholesky overwrites u entirely; CPU CG computes r = f - K·u to handle
+    // warm starts. GPU CG must start from u = 0.
+    for v in u.iter_mut() { *v = 0.0; }
+    let mut r  = f.to_vec();
+    let mut z  = vec![0.0_f64; n];
+    let mut kp = vec![0.0_f64; n];
+
+    // First preconditioner application: z = M⁻¹·r
+    let use_ilu = gpu_k.precondition(&r, &mut z).is_ok();
+    if !use_ilu {
+        eprintln!("[gpu] ILU precondition failed on iter 0, falling back to Jacobi");
+        for i in 0..n { z[i] = r[i] / diag[i]; }
+    }
+
+    let mut p  = z.clone();
+    let mut rz = dot(&r, &z);
+
+    let mut iterations   = 0;
+    let mut rel_residual = dot(&r, &r).sqrt() / f_norm;
+
+    for iter in 0..max_iter {
+        iterations   = iter + 1;
+        rel_residual = dot(&r, &r).sqrt() / f_norm;
+        if rel_residual < tol { break; }
+
+        // SpMV: kp = K·p
+        if let Err(e) = gpu_k.matvec(&p, &mut kp) {
+            eprintln!("[gpu] matvec iter {iter}: {e}");
+            return CgResult { iterations: iter, rel_residual: f64::INFINITY, converged: false };
+        }
+
+        let pkp = dot(&p, &kp);
+        if pkp.abs() < 1e-30 { break; }
+        let alpha = rz / pkp;
+
+        for i in 0..n {
+            u[i] += alpha * p[i];
+            r[i] -= alpha * kp[i];
+        }
+
+        // Preconditioner: z = M⁻¹·r  (ILU or Jacobi fallback)
+        if use_ilu {
+            if let Err(e) = gpu_k.precondition(&r, &mut z) {
+                eprintln!("[gpu] ILU precondition failed iter {iter}: {e}");
+                for i in 0..n { z[i] = r[i] / diag[i]; }
+            }
+        } else {
+            for i in 0..n { z[i] = r[i] / diag[i]; }
+        }
+
+        let rz_new = dot(&r, &z);
+        let beta   = rz_new / rz.max(1e-30);
+        for i in 0..n { p[i] = z[i] + beta * p[i]; }
+        rz = rz_new;
+    }
+
+    CgResult { iterations, rel_residual, converged: rel_residual < tol }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 #[inline]
@@ -242,14 +327,13 @@ fn csr_matvec_local(
     k_vals: &[f64],
     u:      &[f64],
 ) -> Vec<f64> {
+    use rayon::prelude::*;
     let n = k_rows.len() - 1;
-    let mut f = vec![0.0f64; n];
-    for i in 0..n {
-        for pos in k_rows[i]..k_rows[i + 1] {
-            f[i] += k_vals[pos] * u[k_cols[pos]];
-        }
-    }
-    f
+    (0..n).into_par_iter().map(|i| {
+        (k_rows[i]..k_rows[i + 1])
+            .map(|pos| k_vals[pos] * u[k_cols[pos]])
+            .sum()
+    }).collect()
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

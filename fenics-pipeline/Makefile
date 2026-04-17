@@ -1,4 +1,4 @@
-.PHONY: setup check build up down run test clean-outputs shell logs status import-stl
+.PHONY: setup check build up down run build-solver test clean-outputs shell logs status import-stl
 
 # ── First-time setup ────────────────────────────────────────────────────────
 setup:
@@ -30,6 +30,10 @@ run:
 		/workspace/notebooks/pipeline_full.ipynb \
 		/workspace/outputs/executed_nbs/pipeline_full_$(shell date +%Y%m%d_%H%M%S).ipynb \
 		--kernel fenics-pipeline
+
+# ── Build Rust solver ────────────────────────────────────────────────────────
+build-solver:
+	docker-compose exec fenics-pipeline bash scripts/build_solver.sh
 
 # ── Tests ────────────────────────────────────────────────────────────────────
 test:

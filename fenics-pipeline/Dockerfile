@@ -24,7 +24,10 @@ RUN pip install --no-cache-dir \
         gmsh==4.12.2 \
         vtk==9.3.1 \
         pyvista==0.43.10 \
-        trimesh==4.4.0 \
+        trimesh \
+        open3d \
+        manifold3d \
+        pymeshfix \
         networkx \
         scikit-image==0.24.0 \
         papermill==2.6.0 \

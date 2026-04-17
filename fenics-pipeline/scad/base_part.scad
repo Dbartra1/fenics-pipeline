@@ -1,9 +1,9 @@
 // scad/base_part.scad
 // Parametric mounting bracket.
 // All caps variables are injected via -D flags from openscad_runner.py.
-// Do not hardcode dimensions here — edit scad/params.json instead.
+// Do not hardcode dimensions here — edit scad/base_part_params.json instead.
 
-// ── Parameters (defaults match scad/params.json) ──────────────────────────
+// ── Parameters (defaults match scad/base_part_params.json) ────────────────
 LENGTH                 = 100.0;
 WIDTH                  = 60.0;
 HEIGHT                 = 20.0;

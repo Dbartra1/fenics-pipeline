@@ -1,5 +1,5 @@
 {
-  "_comment": "Default parameters for base_part.scad. Overridden at runtime by Papermill.",
+  "_comment": "Parameters for base_part.scad — flat mounting bracket, top-loaded, corner-fixed.",
   "part_name": "base_part",
   "geometry": {
     "length": 100.0,
@@ -19,6 +19,32 @@
     "primary_face": "top",
     "load_magnitude_n": 10000.0
   },
+  "load_case": {
+    "fixed": {
+      "face": "z_min",
+      "selector": "corners",
+      "inset_m": 0.010,
+      "disk_radius_m": 0.005
+    },
+    "load": {
+      "face": "z_max",
+      "direction": [0.0, 0.0, -1.0],
+      "magnitude_n": 10000.0
+    }
+  },
+  "nondesign_regions": [
+    {
+      "type": "cylinder_z",
+      "centers_m": [
+        [0.010, 0.010],
+        [0.090, 0.010],
+        [0.010, 0.050],
+        [0.090, 0.050]
+      ],
+      "void_radius_m": 0.0045,
+      "wall_radius_m": 0.0105
+    }
+  ],
   "boundary_conditions": {
     "fixed_face": "corners",
     "load_face": "top",
