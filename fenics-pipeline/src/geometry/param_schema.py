@@ -275,6 +275,81 @@ class VoidRegion:
             assert self.radius is not None and self.radius > 0, \
                 "cylinder_z_exterior requires radius > 0"
 
+
+@dataclass
+class BoltSeatRegion:
+    """
+    A bolt passing through the part with forced-solid collars only at the
+    entry/exit faces, NOT along the full length.
+
+    Physical model:
+      - Through-hole (always void) spans the full axis
+      - Solid collar (nondesign) exists only within ``seat_depth_m`` of each face
+      - Middle of the bolt path: void core, surrounded by design space that
+        the optimizer can shape freely
+
+    This replaces the common misuse of ``cylinder_x/y/z`` NondesignRegion
+    for bracket-style parts, where a full-length forced-solid sleeve
+    consumes most of the material budget before optimization begins.
+
+    Fields
+    ------
+    type:            "bolt_seat_x" | "bolt_seat_y" | "bolt_seat_z"
+                     Axis the bolt passes along.
+                        _x → centers in (y, z), bolt enters at x_min/x_max
+                        _y → centers in (x, z), bolt enters at y_min/y_max
+                        _z → centers in (x, y), bolt enters at z_min/z_max
+    centers_m:       list of [a, b] pairs — in-plane centre of each bolt
+    void_radius_m:   through-hole radius (always void, whole axis span)
+    wall_radius_m:   collar radius (forced solid, only within seat_depth_m
+                     of entry/exit). Must be >= void_radius_m.
+    seat_depth_m:    how far the collar extends from each face (metres).
+                     Typical: 3–8 mm (0.003–0.008). Must be > 0.
+    entry_seat:      if True, emit a solid collar at the low-coord face
+                     (x_min, y_min, or z_min depending on axis). Default True.
+    exit_seat:       if True, emit a solid collar at the high-coord face.
+                     Default True.  Setting either to False models a blind
+                     bolt (one-sided anchor).
+
+    Example: 4 NEMA-17 motor bolts, 4mm through-hole, 3mm collar,
+    5mm seat depth from the x_max face only (motor plate):
+
+        {
+          "type": "bolt_seat_x",
+          "centers_m": [[0.0145, 0.0245], [0.0455, 0.0245],
+                        [0.0145, 0.0555], [0.0455, 0.0555]],
+          "void_radius_m": 0.002,
+          "wall_radius_m": 0.003,
+          "seat_depth_m":  0.005,
+          "entry_seat":    false,
+          "exit_seat":     true
+        }
+    """
+    type:           str
+    centers_m:      List
+    void_radius_m:  float
+    wall_radius_m:  float
+    seat_depth_m:   float
+    entry_seat:     bool = True
+    exit_seat:      bool = True
+
+    VALID_TYPES = {"bolt_seat_x", "bolt_seat_y", "bolt_seat_z"}
+
+    def validate(self) -> None:
+        assert self.type in self.VALID_TYPES, \
+            f"BoltSeatRegion type must be one of {self.VALID_TYPES}, got '{self.type}'"
+        assert self.void_radius_m > 0, "void_radius_m must be > 0"
+        assert self.wall_radius_m >= self.void_radius_m, \
+            "wall_radius_m must be >= void_radius_m"
+        assert self.seat_depth_m > 0, "seat_depth_m must be > 0"
+        assert len(self.centers_m) > 0, "centers_m must not be empty"
+        for c in self.centers_m:
+            assert len(c) == 2, "each center must be [a, b]"
+        assert self.entry_seat or self.exit_seat, \
+            "at least one of entry_seat or exit_seat must be True " \
+            "(otherwise the bolt has no anchor points)"
+
+
 @dataclass
 class LoadHints:
     """Kept for backward compatibility with Stage 03 FEniCSx path."""
@@ -309,7 +384,13 @@ class PipelineParams:
     nondesign_regions:    List[NondesignRegion]          = field(default_factory=list)
     
     # Phase 3: axis-aligned box regions forced void (empty space in non-rectangular parts)
+    # Phase 3: axis-aligned box regions forced void (empty space in non-rectangular parts)
     void_regions:         List[VoidRegion]               = field(default_factory=list)
+
+    # Phase 4: bolt seats (through-hole + collar only at entry/exit faces).
+    # Preferred over full-length cylinder_* NondesignRegion for bracket-
+    # style parts where a thick sleeve would burn the material budget.
+    bolt_seats:           List[BoltSeatRegion]            = field(default_factory=list)
 
     def validate(self) -> None:
         """Run all sub-validators."""
@@ -322,6 +403,8 @@ class PipelineParams:
         for r in self.nondesign_regions:
             r.validate()
         for r in self.void_regions:
+            r.validate()
+        for r in self.bolt_seats:
             r.validate()
 
     @classmethod
@@ -362,10 +445,18 @@ class PipelineParams:
         ]
 
         # Parse void_regions if present (Phase 3)
+        # Parse void_regions if present (Phase 3)
         vr_raw = raw.get("void_regions", [])
         void_regions = [
             VoidRegion(**{k: v for k, v in r.items() if not k.startswith("_")})
             for r in vr_raw
+        ]
+
+        # Parse bolt_seats if present (Phase 4)
+        bs_raw = raw.get("bolt_seats", [])
+        bolt_seats = [
+            BoltSeatRegion(**{k: v for k, v in r.items() if not k.startswith("_")})
+            for r in bs_raw
         ]
 
         return cls(
@@ -379,6 +470,7 @@ class PipelineParams:
             load_case_config=load_case_config,
             nondesign_regions=nondesign_regions,
             void_regions=void_regions,
+            bolt_seats=bolt_seats,
         )
 
     def to_openscad_defines(self) -> dict:

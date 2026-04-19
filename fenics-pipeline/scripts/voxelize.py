@@ -12,7 +12,7 @@ import math
 
 import numpy as np
 from src.geometry.param_schema import (
-    GeometryParams, LoadCaseConfig, NondesignRegion, VoidRegion
+    GeometryParams, LoadCaseConfig, NondesignRegion, VoidRegion, BoltSeatRegion
 )
 from src.geometry.region_factory import part_center_m
 
@@ -42,6 +42,7 @@ def voxelize_domain(
     grid_config: dict,
     nondesign_regions=None,   # list[NondesignRegion] or None  (Phase 2)
     void_regions=None,        # list[VoidRegion] or None       (Phase 3)
+    bolt_seats=None,          # list[BoltSeatRegion] or None   (Phase 4)
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns (nondesign, void_mask), each shape (nz, ny, nx), dtype uint8.
@@ -50,6 +51,8 @@ def voxelize_domain(
     Otherwise falls back to legacy corner-hole logic derived from geometry_params.
     If void_regions is provided (Phase 3), those box regions are forced void
     unconditionally — used to mask the empty space in non-rectangular parts.
+    If bolt_seats is provided (Phase 4), each bolt passes through as a
+    full-axis void with forced-solid collars only near entry/exit faces.
     """
     nx = grid_config["nx"]
     ny = grid_config["ny"]
@@ -131,6 +134,61 @@ def voxelize_domain(
 
             void_mask[mask] = 1
             nondesign[mask] = 0   # void takes priority
+
+    # ── Phase 4: bolt seats ───────────────────────────────────────────────
+    # Through-hole void along full axis; solid collar only within seat_depth
+    # of the entry/exit face.  The middle of the bolt path is neither forced
+    # solid nor forced void — optimizer chooses.
+    if bolt_seats:
+        # Domain extents in metres (nx voxels × h = total length along each axis)
+        x_max_m = nx * h
+        y_max_m = ny * h
+        z_max_m = nz * h
+
+        for region in bolt_seats:
+            for ca, cb in region.centers_m:
+                if region.type == "bolt_seat_x":
+                    # bolt along x; collars at x=0 (entry) and x=x_max (exit)
+                    r2 = (Y - ca) ** 2 + (Z - cb) ** 2
+                    axis_coord = X
+                    low_face   = 0.0
+                    high_face  = x_max_m
+                elif region.type == "bolt_seat_y":
+                    r2 = (X - ca) ** 2 + (Z - cb) ** 2
+                    axis_coord = Y
+                    low_face   = 0.0
+                    high_face  = y_max_m
+                elif region.type == "bolt_seat_z":
+                    r2 = (X - ca) ** 2 + (Y - cb) ** 2
+                    axis_coord = Z
+                    low_face   = 0.0
+                    high_face  = z_max_m
+                else:
+                    raise ValueError(
+                        f"Unknown BoltSeatRegion type: {region.type}"
+                    )
+
+                void_r2 = region.void_radius_m ** 2
+                wall_r2 = region.wall_radius_m ** 2
+
+                # Through-hole: full-axis void inside void_radius
+                void_mask[r2 < void_r2] = 1
+
+                # Collars: forced solid within wall_radius AND
+                # within seat_depth of the relevant face.
+                if region.entry_seat:
+                    collar_mask = (
+                        (r2 < wall_r2) &
+                        (axis_coord < low_face + region.seat_depth_m)
+                    )
+                    nondesign[collar_mask] = 1
+
+                if region.exit_seat:
+                    collar_mask = (
+                        (r2 < wall_r2) &
+                        (axis_coord > high_face - region.seat_depth_m)
+                    )
+                    nondesign[collar_mask] = 1
 
     # void always takes priority over nondesign (catches any remaining overlap)
     nondesign[void_mask == 1] = 0

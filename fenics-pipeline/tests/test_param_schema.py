@@ -203,13 +203,22 @@ class TestLiveJSONCompat:
     """
 
     @pytest.mark.parametrize("part_name", [
-        "base_part", "cantilever_arm", "tripod_mount_base",
+        "base_part", "cantilever_arm", "tripod_mount_base", "motor_mount",
     ])
     def test_parse_ok(self, part_name):
         path = SCAD_DIR / f"{part_name}_params.json"
         raw = json.loads(path.read_text())
         p = PipelineParams.from_dict(raw)
         p.validate()  # must not raise
+
+    def test_motor_mount_uses_bolt_seats(self):
+        """Motor mount should use bolt_seats, not cylinder_x nondesign."""
+        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
+        p = PipelineParams.from_dict(raw)
+        assert len(p.bolt_seats) > 0, "motor_mount should declare bolt_seats"
+        # All bolt seats should be along x axis (wall-to-motor direction)
+        for bs in p.bolt_seats:
+            assert bs.type == "bolt_seat_x"
 
     def test_base_part_load_defaults_to_full(self):
         """base_part.json has no `selector` on load → should default to 'full'."""
