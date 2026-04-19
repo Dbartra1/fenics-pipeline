@@ -116,24 +116,28 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
 
         x = oc.x_new;
 
-        if n_iterations > 10 {
+        if n_iterations > cfg.min_iterations {
             let recent = &compliance_history[compliance_history.len() - 10..];
             let c_max = recent.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let c_min = recent.iter().cloned().fold(f64::INFINITY,     f64::min);
             let spread = (c_max - c_min) / (c_max.abs() + 1e-30);
-            if spread < cfg.convergence_tol {
-                println!("✓ Compliance flat (spread={spread:.2e} < tol={}) — converged at iteration {n_iterations}",
-                         cfg.convergence_tol);
+            let s_tol = cfg.spread_tol();
+            if spread < s_tol {
+                println!("✓ Compliance flat (spread={spread:.2e} < tol={s_tol:.2e}) — converged at iteration {n_iterations} (min_iter={})",
+                         cfg.min_iterations);
                 converged = true;
                 break;
             }
         }
 
-        if rho_change < cfg.convergence_tol {
-            println!("✓ Density change {rho_change:.4e} < tol {} — converged at iteration {n_iterations}",
-                     cfg.convergence_tol);
-            converged = true;
-            break;
+        if n_iterations > cfg.min_iterations {
+            let d_tol = cfg.density_tol();
+            if rho_change < d_tol {
+                println!("✓ Density change {rho_change:.4e} < tol {d_tol:.2e} — converged at iteration {n_iterations} (min_iter={})",
+                         cfg.min_iterations);
+                converged = true;
+                break;
+            }
         }
     }
 
@@ -192,14 +196,17 @@ mod tests {
             material: Material { young: 210e9, poisson: 0.3 },
             load_case: LoadCase { fixed_dofs, load_dofs, load_vals },
             config: SimpConfig {
-                volume_fraction:  0.5,
-                penal:            3.0,
-                filter_radius:    0.002,
-                max_iterations:   30,
-                convergence_tol:  0.01,
-                move_limit:       0.2,
-                damping:          0.5,
-                checkpoint_every: 0,
+                volume_fraction:       0.5,
+                penal:                 3.0,
+                filter_radius:         0.002,
+                max_iterations:        30,
+                min_iterations:        10,
+                convergence_tol:       0.01,
+                compliance_spread_tol: None,
+                density_change_tol:    None,
+                move_limit:            0.2,
+                damping:               0.5,
+                checkpoint_every:      0,
             },
             nondesign: vec![false; n_elem],
             void_mask: vec![false; n_elem],

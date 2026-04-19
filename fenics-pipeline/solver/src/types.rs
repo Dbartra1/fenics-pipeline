@@ -163,28 +163,57 @@ impl LoadCase {
     }
 }
 
-// ─── SimpConfig ───────────────────────────────────────────────────────────────
-
 /// Solver configuration — all SIMP algorithm parameters.
 ///
-/// `volume_fraction`  — target fraction of solid material (0 < vf < 1).
-/// `penal`            — penalization exponent p (typically 3.0).
-/// `filter_radius`    — sensitivity filter radius in metres.
-/// `max_iterations`   — hard stop if convergence not reached.
-/// `convergence_tol`  — max density change Δρ to declare convergence.
-/// `move_limit`       — OC update step size (fraction of density range).
-/// `damping`          — OC damping η; 0.5 breaks 2-cycle oscillation.
-/// `checkpoint_every` — write density.bin every N iterations (0 = disabled).
+/// `volume_fraction`       — target fraction of solid material (0 < vf < 1).
+/// `penal`                 — penalization exponent p (typically 3.0).
+/// `filter_radius`         — sensitivity filter radius in metres.
+/// `max_iterations`        — hard stop if convergence not reached.
+/// `min_iterations`        — minimum iterations before convergence checks fire.
+///                           Default 10. Set higher (e.g. 50) for stage-2 runs
+///                           that start on a plateau and would otherwise
+///                           terminate prematurely.
+/// `convergence_tol`       — legacy single tolerance, now a fallback.
+///                           If `compliance_spread_tol` / `density_change_tol`
+///                           are None, both checks use this value.
+/// `compliance_spread_tol` — optional separate threshold for the rolling
+///                           10-iteration compliance spread check.
+///                           When Some(x), overrides `convergence_tol`
+///                           for compliance-flatness detection.
+/// `density_change_tol`    — optional separate threshold for the per-iteration
+///                           density-change (Δρ) check.
+///                           When Some(x), overrides `convergence_tol`
+///                           for density-change detection.
+/// `move_limit`            — OC update step size (fraction of density range).
+/// `damping`               — OC damping η; 0.5 breaks 2-cycle oscillation.
+/// `checkpoint_every`      — write density.bin every N iterations (0 = off).
 #[derive(Debug, Clone)]
 pub struct SimpConfig {
     pub volume_fraction: f64,
     pub penal: f64,
     pub filter_radius: f64,
     pub max_iterations: usize,
+    pub min_iterations: usize,
     pub convergence_tol: f64,
+    pub compliance_spread_tol: Option<f64>,
+    pub density_change_tol: Option<f64>,
     pub move_limit: f64,
     pub damping: f64,
     pub checkpoint_every: usize,
+}
+
+impl SimpConfig {
+    /// Effective spread tolerance: overridden value if set, else `convergence_tol`.
+    #[inline]
+    pub fn spread_tol(&self) -> f64 {
+        self.compliance_spread_tol.unwrap_or(self.convergence_tol)
+    }
+
+    /// Effective density-change tolerance: overridden value if set, else `convergence_tol`.
+    #[inline]
+    pub fn density_tol(&self) -> f64 {
+        self.density_change_tol.unwrap_or(self.convergence_tol)
+    }
 }
 
 impl SimpConfig {
@@ -532,7 +561,10 @@ mod tests {
             penal: 3.0,
             filter_radius: 0.008,
             max_iterations: 200,
+            min_iterations: 10,
             convergence_tol: 0.002,
+            compliance_spread_tol: None,
+            density_change_tol: None,
             move_limit: 0.05,
             damping: 0.5,
             checkpoint_every: 10,
@@ -628,5 +660,42 @@ mod tests {
             x_init: Some(xi),
         };
         assert!(p.validate().is_err());
+    }
+
+    // ── SimpConfig: spread_tol / density_tol helpers ──────────────────────────
+
+    #[test]
+    fn spread_tol_falls_back_to_convergence_tol() {
+        let c = default_config();
+        assert_eq!(c.spread_tol(), c.convergence_tol);
+        assert_eq!(c.density_tol(), c.convergence_tol);
+    }
+
+    #[test]
+    fn spread_tol_uses_override_when_set() {
+        let mut c = default_config();
+        c.compliance_spread_tol = Some(1e-5);
+        assert_eq!(c.spread_tol(), 1e-5);
+        // Density tolerance still falls through to convergence_tol
+        assert_eq!(c.density_tol(), c.convergence_tol);
+    }
+
+    #[test]
+    fn density_tol_uses_override_when_set() {
+        let mut c = default_config();
+        c.density_change_tol = Some(5e-4);
+        assert_eq!(c.density_tol(), 5e-4);
+        // Spread tolerance still falls through to convergence_tol
+        assert_eq!(c.spread_tol(), c.convergence_tol);
+    }
+
+    #[test]
+    fn both_overrides_independent() {
+        let mut c = default_config();
+        c.compliance_spread_tol = Some(1e-5);
+        c.density_change_tol    = Some(5e-4);
+        c.convergence_tol       = 999.0;      // both ignore this
+        assert_eq!(c.spread_tol(),  1e-5);
+        assert_eq!(c.density_tol(), 5e-4);
     }
 }

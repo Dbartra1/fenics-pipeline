@@ -37,16 +37,24 @@ struct MaterialJson {
     young: f64, poisson: f64,
 }
 
+fn default_min_iterations() -> usize { 10 }
+
 #[derive(Deserialize)]
 struct ConfigJson {
-    volume_fraction:  f64,
-    penal:            f64,
-    filter_radius:    f64,
-    max_iterations:   usize,
-    convergence_tol:  f64,
-    move_limit:       f64,
-    damping:          f64,
-    checkpoint_every: usize,
+    volume_fraction:       f64,
+    penal:                 f64,
+    filter_radius:         f64,
+    max_iterations:        usize,
+    #[serde(default = "default_min_iterations")]
+    min_iterations:        usize,
+    convergence_tol:       f64,
+    #[serde(default)]
+    compliance_spread_tol: Option<f64>,
+    #[serde(default)]
+    density_change_tol:    Option<f64>,
+    move_limit:            f64,
+    damping:               f64,
+    checkpoint_every:      usize,
 }
 
 #[derive(Deserialize)]
@@ -170,14 +178,17 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
         material: Material { young: pj.material.young, poisson: pj.material.poisson },
         load_case,
         config: SimpConfig {
-            volume_fraction:  pj.config.volume_fraction,
-            penal:            pj.config.penal,
-            filter_radius:    pj.config.filter_radius,
-            max_iterations:   pj.config.max_iterations,
-            convergence_tol:  pj.config.convergence_tol,
-            move_limit:       pj.config.move_limit,
-            damping:          pj.config.damping,
-            checkpoint_every: pj.config.checkpoint_every,
+            volume_fraction:       pj.config.volume_fraction,
+            penal:                 pj.config.penal,
+            filter_radius:         pj.config.filter_radius,
+            max_iterations:        pj.config.max_iterations,
+            min_iterations:        pj.config.min_iterations,
+            convergence_tol:       pj.config.convergence_tol,
+            compliance_spread_tol: pj.config.compliance_spread_tol,
+            density_change_tol:    pj.config.density_change_tol,
+            move_limit:            pj.config.move_limit,
+            damping:               pj.config.damping,
+            checkpoint_every:      pj.config.checkpoint_every,
         },
         nondesign,
         void_mask,
