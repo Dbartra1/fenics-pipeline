@@ -15,7 +15,7 @@
 // `cg_solve_direct` now dispatches to Cholesky; the CG implementation is
 // preserved as `cg_solve_inner` for diagnostics and the existing test suite.
 //
-// ── faer 0.19 sparse API note ─────────────────────────────────────────────────
+/// ── faer 0.19 sparse API note ─────────────────────────────────────────────────
 // After adding `faer = { version = "0.19", features = ["sparse"] }` to
 // Cargo.toml, run `cargo doc --open` and verify:
 //   1. `faer::sparse::SparseColMat::<I, E>` — confirm the index type I.
@@ -23,6 +23,9 @@
 //      If `usize` constructors don't exist, try `i32`.
 //   2. The constructor name: `try_new_from_col_major_sorted` vs
 //      `new_from_csc_data_checked` vs `try_new_from_triplets`.
+
+use crate::preconditioner::{JacobiPreconditioner, Preconditioner};
+
 //   3. `Cholesky::try_new` signature — some versions take a `Side` argument
 //      (Upper/Lower), others infer from the stored triangle.
 //   4. `solve_in_place` vs `solve_mut` for back-substitution.
@@ -151,24 +154,35 @@ pub fn cg_solve_inner(
     tol:      f64,
     max_iter: usize,
 ) -> CgResult {
+    let precond = JacobiPreconditioner::new(k_rows, k_cols, k_vals);
+    cg_solve_with_precond(k_rows, k_cols, k_vals, f, u, tol, max_iter, &precond)
+}
+
+/// Preconditioned CG against an arbitrary `Preconditioner`. The public
+/// `cg_solve_inner` wraps this with a Jacobi preconditioner to preserve the
+/// existing call-site contract; Phase 6 will expose config-driven dispatch.
+pub fn cg_solve_with_precond(
+    k_rows:   &[usize],
+    k_cols:   &[usize],
+    k_vals:   &[f64],
+    f:        &[f64],
+    u:        &mut [f64],
+    tol:      f64,
+    max_iter: usize,
+    precond:  &dyn Preconditioner,
+) -> CgResult {
     let n = f.len();
-
-    // ── Jacobi preconditioner ─────────────────────────────────────────────
-    let mut diag = vec![1.0f64; n];
-    for i in 0..n {
-        let row = &k_cols[k_rows[i]..k_rows[i + 1]];
-        if let Ok(local) = row.binary_search(&i) {
-            let d = k_vals[k_rows[i] + local];
-            if d.abs() > 1e-30 { diag[i] = d; }
-        }
-    }
-
     let f_norm = dot(f, f).sqrt().max(1e-30);
 
     let ku = csr_matvec_local(k_rows, k_cols, k_vals, u);
     let mut r: Vec<f64> = f.iter().zip(ku.iter()).map(|(fi, ki)| fi - ki).collect();
 
-    let z: Vec<f64> = r.iter().zip(diag.iter()).map(|(ri, di)| ri / di).collect();
+    // Pre-allocate z once; reuse across iterations. Pre-refactor code allocated
+    // a fresh Vec each call via `.collect()`; arithmetic is identical, only the
+    // allocation pattern differs.
+    let mut z = vec![0.0f64; n];
+    precond.apply(&r, &mut z);
+
     let mut p = z.clone();
     let mut rz = dot(&r, &z);
 
@@ -183,21 +197,19 @@ pub fn cg_solve_inner(
         let kp = csr_matvec_local(k_rows, k_cols, k_vals, &p);
         let pkp = dot(&p, &kp);
         if pkp.abs() < 1e-30 { break; }
-        let alpha = rz / pkp;
 
+        let alpha = rz / pkp;
         for i in 0..n {
             u[i] += alpha * p[i];
             r[i] -= alpha * kp[i];
         }
 
-        let z_new: Vec<f64> = r.iter().zip(diag.iter()).map(|(ri, di)| ri / di).collect();
-        let rz_new = dot(&r, &z_new);
+        precond.apply(&r, &mut z);
+        let rz_new = dot(&r, &z);
         let beta = rz_new / rz.max(1e-30);
-
         for i in 0..n {
-            p[i] = z_new[i] + beta * p[i];
+            p[i] = z[i] + beta * p[i];
         }
-
         rz = rz_new;
     }
 

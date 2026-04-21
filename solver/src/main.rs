@@ -12,6 +12,8 @@ mod filter;
 mod io;
 mod ke_base;
 mod oc_update;
+mod multigrid;
+mod preconditioner;
 mod sensitivity;
 mod simp;
 mod solver;
