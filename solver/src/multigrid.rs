@@ -286,12 +286,160 @@ fn invert_3x3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
     Some(inv)
 }
 
+// ── Prolongation operator ─────────────────────────────────────────────────
+
+/// Prolongation operator P: coarse grid → fine grid via trilinear interpolation.
+///
+/// Grid convention:
+///   Fine grid:   nx × ny × nz nodes (0-based), DOFs interleaved [ux,uy,uz] per node.
+///   Coarse grid: cx × cy × cz nodes, cx = (nx+1)/2, same for y and z.
+///   Coarse node (ci,cj,ck) maps exactly to fine node (2·ci, 2·cj, 2·ck).
+///
+/// Weight per fine node (tensor product of 1D stencil [1/2, 1, 1/2]):
+///   0 odd axes → 1 parent,  weight 1.0   (coincide)
+///   1 odd axis → 2 parents, weight 0.5   (edge centre)
+///   2 odd axes → 4 parents, weight 0.25  (face centre)
+///   3 odd axes → 8 parents, weight 0.125 (body centre)
+///
+/// Boundary: off-grid coarse parents are zero-extended (skipped).
+/// Use odd fine-grid dimensions so every fine boundary node coincides with a
+/// coarse node — this keeps partition-of-unity intact at all fine nodes and
+/// avoids one-sided interpolation at the grid edge.
+pub struct Prolongation {
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    pub cx: usize,
+    pub cy: usize,
+    pub cz: usize,
+}
+
+impl Prolongation {
+    pub fn new(nx: usize, ny: usize, nz: usize) -> Self {
+        Self { nx, ny, nz, cx: (nx + 1) / 2, cy: (ny + 1) / 2, cz: (nz + 1) / 2 }
+    }
+
+    /// u_fine ← P · u_coarse  (overwrites u_fine).
+    ///
+    /// u_coarse: length 3·cx·cy·cz
+    /// u_fine:   length 3·nx·ny·nz
+    pub fn apply(&self, u_coarse: &[f64], u_fine: &mut [f64]) {
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let (cx, cy, cz) = (self.cx, self.cy, self.cz);
+        assert_eq!(u_coarse.len(), 3 * cx * cy * cz);
+        assert_eq!(u_fine.len(),   3 * nx * ny * nz);
+        u_fine.iter_mut().for_each(|v| *v = 0.0);
+
+        for fz in 0..nz {
+            let (z0, zc) = if fz % 2 == 0 { (fz / 2, 1usize) } else { (fz / 2, 2) };
+            let zw = if fz % 2 == 0 { 1.0_f64 } else { 0.5 };
+            for fy in 0..ny {
+                let (y0, yc) = if fy % 2 == 0 { (fy / 2, 1usize) } else { (fy / 2, 2) };
+                let yw = if fy % 2 == 0 { 1.0_f64 } else { 0.5 };
+                for fx in 0..nx {
+                    let (x0, xc) = if fx % 2 == 0 { (fx / 2, 1usize) } else { (fx / 2, 2) };
+                    let xw = if fx % 2 == 0 { 1.0_f64 } else { 0.5 };
+                    let fine_node = fz * ny * nx + fy * nx + fx;
+                    for dk in 0..zc {
+                        let ck = z0 + dk; if ck >= cz { continue; }
+                        for dj in 0..yc {
+                            let cj = y0 + dj; if cj >= cy { continue; }
+                            for di in 0..xc {
+                                let ci = x0 + di; if ci >= cx { continue; }
+                                let coarse_node = ck * cy * cx + cj * cx + ci;
+                                let w = xw * yw * zw;
+                                for d in 0..3 {
+                                    u_fine[3 * fine_node + d] +=
+                                        w * u_coarse[3 * coarse_node + d];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── Restriction operator ──────────────────────────────────────────────────
+
+/// Restriction operator R = Pᵀ: fine grid → coarse grid.
+///
+/// Implemented as the exact algebraic transpose of Prolongation: the identical
+/// stencil loop with source and destination swapped. This guarantees
+///
+///   ⟨R·x, y⟩  ==  ⟨x, P·y⟩   (to machine precision)
+///
+/// which is necessary for the Phase 4 Galerkin coarse operator
+/// A_H = Pᵀ·A_h·P to be SPD when A_h is SPD.
+///
+/// Row sums of R:
+///   Interior coarse nodes: 8  (column of P sums to 8 over all contributing fine nodes)
+///   Boundary coarse nodes: < 8 (fewer fine neighbours within the domain)
+///
+/// This is NOT the "full-weighting" restriction with row sums of 1 that some
+/// texts describe. Those texts scale by 1/8, breaking the exact transpose
+/// property. We keep R = Pᵀ unscaled; the V-cycle is scaled in Phase 5.
+pub struct Restriction {
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+    pub cx: usize,
+    pub cy: usize,
+    pub cz: usize,
+}
+
+impl Restriction {
+    pub fn new(nx: usize, ny: usize, nz: usize) -> Self {
+        Self { nx, ny, nz, cx: (nx + 1) / 2, cy: (ny + 1) / 2, cz: (nz + 1) / 2 }
+    }
+
+    /// u_coarse ← R · u_fine  (overwrites u_coarse).
+    ///
+    /// u_fine:   length 3·nx·ny·nz
+    /// u_coarse: length 3·cx·cy·cz
+    pub fn apply(&self, u_fine: &[f64], u_coarse: &mut [f64]) {
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let (cx, cy, cz) = (self.cx, self.cy, self.cz);
+        assert_eq!(u_fine.len(),   3 * nx * ny * nz);
+        assert_eq!(u_coarse.len(), 3 * cx * cy * cz);
+        u_coarse.iter_mut().for_each(|v| *v = 0.0);
+
+        for fz in 0..nz {
+            let (z0, zc) = if fz % 2 == 0 { (fz / 2, 1usize) } else { (fz / 2, 2) };
+            let zw = if fz % 2 == 0 { 1.0_f64 } else { 0.5 };
+            for fy in 0..ny {
+                let (y0, yc) = if fy % 2 == 0 { (fy / 2, 1usize) } else { (fy / 2, 2) };
+                let yw = if fy % 2 == 0 { 1.0_f64 } else { 0.5 };
+                for fx in 0..nx {
+                    let (x0, xc) = if fx % 2 == 0 { (fx / 2, 1usize) } else { (fx / 2, 2) };
+                    let xw = if fx % 2 == 0 { 1.0_f64 } else { 0.5 };
+                    let fine_node = fz * ny * nx + fy * nx + fx;
+                    for dk in 0..zc {
+                        let ck = z0 + dk; if ck >= cz { continue; }
+                        for dj in 0..yc {
+                            let cj = y0 + dj; if cj >= cy { continue; }
+                            for di in 0..xc {
+                                let ci = x0 + di; if ci >= cx { continue; }
+                                let coarse_node = ck * cy * cx + cj * cx + ci;
+                                let w = xw * yw * zw;
+                                for d in 0..3 {
+                                    u_coarse[3 * coarse_node + d] +=
+                                        w * u_fine[3 * fine_node + d];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     // ── Test harness helpers ──────────────────────────────────────────────
-
     /// Build a trivial block-diagonal CSR: each 3×3 block is 2*I. Used for
     /// basic plumbing tests where we need a valid CSR but don't care about
     /// off-diagonal coupling.
@@ -608,5 +756,152 @@ mod tests {
         assert!(rel_err < 1e-10,
             "symmetry check failed: ⟨Sr,s⟩={:.10e}, ⟨r,Ss⟩={:.10e}, rel_err={:.3e}",
             lhs, rhs, rel_err);
+    }
+
+    // ── Transfer operator tests ───────────────────────────────────────────
+
+    /// P · ones_coarse = ones_fine: weights per fine node sum to exactly 1.0
+    /// (partition of unity). Requires odd fine dimensions so boundary fine
+    /// nodes always coincide with a coarse node (no dropped parents).
+    #[test]
+    fn prolongation_preserves_constant_field() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let p = Prolongation::new(nx, ny, nz);
+        let u_coarse = vec![1.0_f64; 3 * p.cx * p.cy * p.cz];
+        let mut u_fine = vec![0.0_f64; 3 * nx * ny * nz];
+        p.apply(&u_coarse, &mut u_fine);
+        for (i, &v) in u_fine.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-14,
+                "u_fine[{i}] = {v:.16e}, expected 1.0");
+        }
+    }
+
+    /// Trilinear interpolation reproduces linear fields exactly.
+    /// Coarse values: f(ci,cj,ck) = 2*(2·ci) + 3*(2·cj) + 5*(2·ck) + (d+1).
+    /// After prolongation every fine node must satisfy f(fx,fy,fz).
+    /// This catches stencil-weight bugs that pass constant fields but fail gradients.
+    #[test]
+    fn prolongation_preserves_linear_field() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let p = Prolongation::new(nx, ny, nz);
+        let (cx, cy, cz) = (p.cx, p.cy, p.cz);
+        let (a, b, c) = (2.0_f64, 3.0, 5.0);
+        let mut u_coarse = vec![0.0_f64; 3 * cx * cy * cz];
+        for ck in 0..cz {
+            for cj in 0..cy {
+                for ci in 0..cx {
+                    let node = ck * cy * cx + cj * cx + ci;
+                    let base = a * (2 * ci) as f64 + b * (2 * cj) as f64 + c * (2 * ck) as f64;
+                    for d in 0..3 { u_coarse[3 * node + d] = base + (d + 1) as f64; }
+                }
+            }
+        }
+        let mut u_fine = vec![0.0_f64; 3 * nx * ny * nz];
+        p.apply(&u_coarse, &mut u_fine);
+        for fz in 0..nz {
+            for fy in 0..ny {
+                for fx in 0..nx {
+                    let node = fz * ny * nx + fy * nx + fx;
+                    let base = a * fx as f64 + b * fy as f64 + c * fz as f64;
+                    for d in 0..3 {
+                        let expected = base + (d + 1) as f64;
+                        let got = u_fine[3 * node + d];
+                        assert!((got - expected).abs() < 1e-12,
+                            "f=({fx},{fy},{fz}) d={d}: got {got:.16e}, expected {expected:.16e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// ⟨R·x_fine, y_coarse⟩ == ⟨x_fine, P·y_coarse⟩ to 1e-13 across 10 random pairs.
+    ///
+    /// This is the load-bearing test for Phase 3. If it passes, R = Pᵀ exactly and
+    /// the Phase 4 Galerkin operator A_H = Pᵀ·A_h·P is guaranteed to be SPD.
+    /// If it fails, do not proceed to Phase 4.
+    #[test]
+    fn restriction_is_transpose_of_prolongation() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let p = Prolongation::new(nx, ny, nz);
+        let r = Restriction::new(nx, ny, nz);
+        let n_fine   = 3 * nx * ny * nz;
+        let n_coarse = 3 * p.cx * p.cy * p.cz;
+
+        for trial in 0..10_u64 {
+            let x_fine: Vec<f64> = (0..n_fine)
+                .map(|i| ((i as f64 + trial as f64 + 1.0) * 0.7).sin())
+                .collect();
+            let y_coarse: Vec<f64> = (0..n_coarse)
+                .map(|i| ((i as f64 + trial as f64 + 1.0) * 1.3).cos())
+                .collect();
+
+            let mut rx = vec![0.0_f64; n_coarse];
+            r.apply(&x_fine, &mut rx);
+            let lhs: f64 = rx.iter().zip(&y_coarse).map(|(a, b)| a * b).sum();
+
+            let mut py = vec![0.0_f64; n_fine];
+            p.apply(&y_coarse, &mut py);
+            let rhs: f64 = x_fine.iter().zip(&py).map(|(a, b)| a * b).sum();
+
+            let scale = lhs.abs().max(rhs.abs()).max(1e-30);
+            let rel_err = (lhs - rhs).abs() / scale;
+            assert!(rel_err < 1e-13,
+                "trial {trial}: ⟨Rx,y⟩={lhs:.10e} ⟨x,Py⟩={rhs:.10e} rel_err={rel_err:.3e}");
+        }
+    }
+
+    /// R = Pᵀ: for interior coarse nodes the column of P sums to 8, so
+    /// R · ones_fine = 8 at those nodes. Boundary nodes receive < 8 (fewer
+    /// fine neighbours in domain) — we only check the interior here.
+    /// Grid: 9×9×9 fine → 5×5×5 coarse; interior coarse = (1..=3)³ (27 nodes).
+    #[test]
+    fn restriction_interior_row_sum_equals_8() {
+        let (nx, ny, nz) = (9, 9, 9);
+        let r = Restriction::new(nx, ny, nz);
+        let (cx, cy, cz) = (r.cx, r.cy, r.cz);
+        let u_fine = vec![1.0_f64; 3 * nx * ny * nz];
+        let mut u_coarse = vec![0.0_f64; 3 * cx * cy * cz];
+        r.apply(&u_fine, &mut u_coarse);
+        for ck in 1..(cz - 1) {
+            for cj in 1..(cy - 1) {
+                for ci in 1..(cx - 1) {
+                    let node = ck * cy * cx + cj * cx + ci;
+                    for d in 0..3 {
+                        let got = u_coarse[3 * node + d];
+                        assert!((got - 8.0).abs() < 1e-13,
+                            "interior ({ci},{cj},{ck}) d={d}: row sum={got:.16e}, expected 8.0");
+                    }
+                }
+            }
+        }
+    }
+
+    /// R·P acts as 8·I on smooth (non-oscillatory) inputs at interior coarse nodes.
+    /// Constant fields are maximally smooth: P·ones_coarse = ones_fine exactly
+    /// (partition of unity), then R·ones_fine = 8·ones_coarse at interior nodes.
+    /// This validates the composition without needing the V-cycle loop from Phase 5.
+    #[test]
+    fn prolongate_then_restrict_constant_field_gives_8x() {
+        let (nx, ny, nz) = (9, 9, 9);
+        let p = Prolongation::new(nx, ny, nz);
+        let r = Restriction::new(nx, ny, nz);
+        let (cx, cy, cz) = (p.cx, p.cy, p.cz);
+        let u_coarse_in = vec![1.0_f64; 3 * cx * cy * cz];
+        let mut u_fine = vec![0.0_f64; 3 * nx * ny * nz];
+        p.apply(&u_coarse_in, &mut u_fine);
+        let mut u_coarse_out = vec![0.0_f64; 3 * cx * cy * cz];
+        r.apply(&u_fine, &mut u_coarse_out);
+        for ck in 1..(cz - 1) {
+            for cj in 1..(cy - 1) {
+                for ci in 1..(cx - 1) {
+                    let node = ck * cy * cx + cj * cx + ci;
+                    for d in 0..3 {
+                        let got = u_coarse_out[3 * node + d];
+                        assert!((got - 8.0).abs() < 1e-13,
+                            "interior ({ci},{cj},{ck}) d={d}: R·P·v={got:.16e}, expected 8.0");
+                    }
+                }
+            }
+        }
     }
 }
