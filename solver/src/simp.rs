@@ -22,7 +22,7 @@ use crate::io::SolveResult;
 use crate::ke_base::compute_ke_base;
 use crate::oc_update::oc_update;
 use crate::sensitivity::{compute_compliance, compute_sensitivities};
-use crate::solver::cg_solve_direct;
+use crate::vcycle_dispatch::solve_linear_system;
 use crate::types::{Problem, RHO_MIN};
 
 pub fn run_simp(problem: &Problem) -> SolveResult {
@@ -84,11 +84,12 @@ pub fn run_simp(problem: &Problem) -> SolveResult {
 
         // FIXED: was `n_dof.min(2000)` — capped CG fallback at 2000 iterations.
         // Cholesky primary path ignores both tol and max_iter.
-        let solve = cg_solve_direct(
+        let solve = solve_linear_system(
             &pattern.k_rows, &pattern.k_cols, &k_bc,
             &f_bc, &mut u,
             1e-6,
-            n_dof,   // was n_dof.min(2000)
+            n_dof,
+            grid.nx + 1, grid.ny + 1, grid.nz + 1,  // node counts, not element counts
         );
 
         let compliance = compute_compliance(&x, &u, &ke, &dof_map, cfg.penal,

@@ -18,6 +18,7 @@ mod sensitivity;
 mod simp;
 mod solver;
 mod types;
+mod vcycle_dispatch;
 
 #[cfg(feature = "gpu")]
 mod gpu_solver;
