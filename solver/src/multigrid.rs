@@ -7,9 +7,9 @@
 //! Multigrid components for the GMG preconditioner (Tier 4).
 //!
 //! Phase 2 lands the block-symmetric red-black Gauss-Seidel smoother.
-//! Later phases will add restriction/prolongation operators (Phase 3),
-//! the level hierarchy with Galerkin coarse operators (Phase 4), and the
-//! V-cycle preconditioner (Phases 5-6).
+//! Phase 3 adds restriction/prolongation transfer operators.
+//! Phase 4 adds the Galerkin coarse operator hierarchy (this phase).
+//! Later phases will add the V-cycle preconditioner (Phases 5-6).
 //!
 //! # Smoother design — why this shape
 //!
@@ -436,10 +436,432 @@ impl Restriction {
     }
 }
 
+// ── Galerkin coarse operator (Phase 4) ───────────────────────────────────
+
+/// Owned CSR matrix. Introduced in Phase 4 so each multigrid level can
+/// carry its stiffness operator without lifetime parameters.
+///
+/// Invariants upheld by every constructor in this module:
+///   row_ptr.len() == n_rows + 1
+///   col_idx and values have the same length (== nnz)
+///   each row's col_idx slice is strictly sorted, values in [0, n_cols)
+pub struct OwnedCsr {
+    pub row_ptr: Vec<usize>,
+    pub col_idx: Vec<usize>,
+    pub values:  Vec<f64>,
+    /// Number of columns. Not inferrable from row_ptr alone for non-square matrices.
+    pub n_cols:  usize,
+}
+
+impl OwnedCsr {
+    /// Number of rows.
+    pub fn n_rows(&self) -> usize {
+        self.row_ptr.len().saturating_sub(1)
+    }
+
+    /// Number of stored nonzeros.
+    pub fn nnz(&self) -> usize {
+        self.values.len()
+    }
+
+    /// y ← self · x. Panics if lengths are inconsistent.
+    pub fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        let n = self.n_rows();
+        assert_eq!(x.len(), self.n_cols,
+            "matvec: x length {} != n_cols {}", x.len(), self.n_cols);
+        assert_eq!(y.len(), n,
+            "matvec: y length {} != n_rows {}", y.len(), n);
+        for i in 0..n {
+            let mut s = 0.0_f64;
+            for k in self.row_ptr[i]..self.row_ptr[i + 1] {
+                s += self.values[k] * x[self.col_idx[k]];
+            }
+            y[i] = s;
+        }
+    }
+
+    /// Extract the main diagonal. Entries missing from the sparsity pattern
+    /// return 0.0. Length = min(n_rows, n_cols).
+    pub fn diagonal(&self) -> Vec<f64> {
+        let n = self.n_rows().min(self.n_cols);
+        let mut d = vec![0.0_f64; n];
+        for i in 0..n {
+            let row = &self.col_idx[self.row_ptr[i]..self.row_ptr[i + 1]];
+            if let Ok(local) = row.binary_search(&i) {
+                d[i] = self.values[self.row_ptr[i] + local];
+            }
+        }
+        d
+    }
+
+    /// Look up a single entry. Returns 0.0 if structurally zero.
+    /// Binary-searches the sorted row slice — O(log nnz_per_row).
+    pub fn get(&self, row: usize, col: usize) -> f64 {
+        let slice = &self.col_idx[self.row_ptr[row]..self.row_ptr[row + 1]];
+        match slice.binary_search(&col) {
+            Ok(local) => self.values[self.row_ptr[row] + local],
+            Err(_)    => 0.0,
+        }
+    }
+}
+
+/// Materialize the Prolongation stencil as an explicit CSR matrix.
+///
+/// Dimensions: N_fine × N_coarse  where N_fine = 3·nx·ny·nz,
+///   N_coarse = 3·cx·cy·cz.
+///
+/// Each fine DOF row has at most 8 nonzeros (one per trilinear coarse parent).
+/// DOFs are interleaved: row 3·fn+d is nonzero only in columns 3·cn+d,
+/// so the stencil is block-diagonal per component (no DOF mixing in P).
+///
+/// Columns within each row are sorted because we sort parents by coarse
+/// node index before writing, and the +d offset preserves that order.
+fn materialize_p_csr(p: &Prolongation) -> OwnedCsr {
+    let (nx, ny, nz) = (p.nx, p.ny, p.nz);
+    let (cx, cy, cz) = (p.cx, p.cy, p.cz);
+    let n_fine   = 3 * nx * ny * nz;
+    let n_coarse = 3 * cx * cy * cz;
+
+    let mut row_ptr = vec![0usize; n_fine + 1];
+    // Upper bound: 8 coarse parents × 3 DOFs per fine DOF.
+    let mut col_idx: Vec<usize> = Vec::with_capacity(8 * n_fine);
+    let mut values:  Vec<f64>   = Vec::with_capacity(8 * n_fine);
+
+    for fz in 0..nz {
+        let (z0, zc) = if fz % 2 == 0 { (fz / 2, 1usize) } else { (fz / 2, 2) };
+        let zw: f64  = if fz % 2 == 0 { 1.0 } else { 0.5 };
+        for fy in 0..ny {
+            let (y0, yc) = if fy % 2 == 0 { (fy / 2, 1usize) } else { (fy / 2, 2) };
+            let yw: f64  = if fy % 2 == 0 { 1.0 } else { 0.5 };
+            for fx in 0..nx {
+                let (x0, xc) = if fx % 2 == 0 { (fx / 2, 1usize) } else { (fx / 2, 2) };
+                let xw: f64  = if fx % 2 == 0 { 1.0 } else { 0.5 };
+                let fine_node = fz * ny * nx + fy * nx + fx;
+
+                // Collect (coarse_node, weight) pairs, sorted by coarse_node.
+                // Sorting here means col_idx within each DOF row is also sorted
+                // (the +d offset shifts all columns uniformly, preserving order).
+                let mut parents: Vec<(usize, f64)> = Vec::with_capacity(8);
+                for dk in 0..zc {
+                    let ck = z0 + dk; if ck >= cz { continue; }
+                    for dj in 0..yc {
+                        let cj = y0 + dj; if cj >= cy { continue; }
+                        for di in 0..xc {
+                            let ci = x0 + di; if ci >= cx { continue; }
+                            let cn = ck * cy * cx + cj * cx + ci;
+                            parents.push((cn, xw * yw * zw));
+                        }
+                    }
+                }
+                parents.sort_unstable_by_key(|&(cn, _)| cn);
+
+                // Write one CSR row per DOF component d ∈ {0,1,2}.
+                // Rows are filled in strictly increasing fine_dof order
+                // (outer loops are fx, fy, fz in ascending order).
+                for d in 0..3 {
+                    for &(cn, w) in &parents {
+                        col_idx.push(3 * cn + d);
+                        values.push(w);
+                    }
+                    row_ptr[3 * fine_node + d + 1] = col_idx.len();
+                }
+            }
+        }
+    }
+
+    OwnedCsr { row_ptr, col_idx, values, n_cols: n_coarse }
+}
+
+/// Compute C = A · B for two sparse matrices in CSR format.
+///
+/// Algorithm: dense-accumulator scatter-gather.
+///   For each output row i:
+///     Scatter: for each (i,k) in A, add A[i,k]·B[k,:] into a dense acc[].
+///     Gather:  collect and sort occupied columns, write to CSR.
+///
+/// The accumulator `acc` has length B.n_cols and is allocated once, reused
+/// across rows. A boolean marker `in_acc` tracks which columns are occupied
+/// so only those entries need to be reset each row — O(nnz_per_output_row),
+/// not O(B.n_cols).
+///
+/// Output column indices within each row are sorted ascending.
+fn spmatmat(
+    a_row_ptr: &[usize], a_col_idx: &[usize], a_values: &[f64],
+    b_row_ptr: &[usize], b_col_idx: &[usize], b_values: &[f64],
+    b_n_cols:  usize,
+) -> OwnedCsr {
+    let n_a = a_row_ptr.len() - 1;
+    let n_b = b_row_ptr.len() - 1;
+
+    let mut c_row_ptr = vec![0usize; n_a + 1];
+    let mut c_col_idx: Vec<usize> = Vec::new();
+    let mut c_values:  Vec<f64>   = Vec::new();
+
+    let mut acc      = vec![0.0_f64; b_n_cols];
+    let mut in_acc   = vec![false;   b_n_cols];
+    let mut occupied: Vec<usize> = Vec::new();
+
+    for i in 0..n_a {
+        // Scatter phase: accumulate contributions from A[i,:] × B.
+        for pa in a_row_ptr[i]..a_row_ptr[i + 1] {
+            let k    = a_col_idx[pa];
+            let a_ik = a_values[pa];
+            debug_assert!(k < n_b,
+                "A col index {k} out of range for B which has {n_b} rows");
+            for pb in b_row_ptr[k]..b_row_ptr[k + 1] {
+                let j = b_col_idx[pb];
+                if !in_acc[j] {
+                    in_acc[j] = true;
+                    occupied.push(j);
+                }
+                acc[j] += a_ik * b_values[pb];
+            }
+        }
+
+        // Gather phase: sort occupied columns, write to output CSR, reset acc.
+        occupied.sort_unstable();
+        for &j in &occupied {
+            c_col_idx.push(j);
+            c_values.push(acc[j]);
+            // Reset here — not in a separate pass — so we only touch occupied entries.
+            acc[j]    = 0.0;
+            in_acc[j] = false;
+        }
+        occupied.clear();
+
+        c_row_ptr[i + 1] = c_col_idx.len();
+    }
+
+    OwnedCsr { row_ptr: c_row_ptr, col_idx: c_col_idx, values: c_values, n_cols: b_n_cols }
+}
+
+/// Compute B = Aᵀ in CSR format.
+///
+/// Standard two-pass algorithm:
+///   Pass 1 — count nnz per output row (= per input column).
+///   Pass 2 — scatter (row i, value v) pairs into output row j.
+///
+/// The scatter order is determined by input row iteration, which is generally
+/// not sorted for output columns. Each output row is sorted after the scatter.
+fn transpose_csr(
+    row_ptr: &[usize],
+    col_idx: &[usize],
+    values:  &[f64],
+    n_rows:  usize,   // rows of A  (= cols of Aᵀ)
+    n_cols:  usize,   // cols of A  (= rows of Aᵀ)
+) -> OwnedCsr {
+    // Pass 1: count entries per output row.
+    let mut counts = vec![0usize; n_cols];
+    for &c in col_idx { counts[c] += 1; }
+
+    // Build output row_ptr.
+    let mut t_row_ptr = vec![0usize; n_cols + 1];
+    for c in 0..n_cols {
+        t_row_ptr[c + 1] = t_row_ptr[c] + counts[c];
+    }
+    let nnz = t_row_ptr[n_cols];
+
+    let mut t_col_idx = vec![0usize; nnz];
+    let mut t_values  = vec![0.0_f64; nnz];
+    // One write cursor per output row, initialised from row_ptr.
+    let mut write_pos: Vec<usize> = t_row_ptr[..n_cols].to_vec();
+
+    // Pass 2: scatter.
+    for i in 0..n_rows {
+        for k in row_ptr[i]..row_ptr[i + 1] {
+            let j = col_idx[k];
+            let p = write_pos[j];
+            t_col_idx[p] = i;
+            t_values[p]  = values[k];
+            write_pos[j] += 1;
+        }
+    }
+
+    // Sort each output row by column index.
+    // For P, fine-node indices arrive in monotone order so rows of Pᵀ are
+    // already sorted. We sort anyway for robustness with arbitrary input.
+    for c in 0..n_cols {
+        let s = t_row_ptr[c];
+        let e = t_row_ptr[c + 1];
+        if e - s <= 1 { continue; }
+        let mut pairs: Vec<(usize, f64)> = t_col_idx[s..e]
+            .iter().zip(t_values[s..e].iter())
+            .map(|(&ci, &vi)| (ci, vi))
+            .collect();
+        pairs.sort_unstable_by_key(|&(ci, _)| ci);
+        for (k, (ci, vi)) in pairs.into_iter().enumerate() {
+            t_col_idx[s + k] = ci;
+            t_values[s + k]  = vi;
+        }
+    }
+
+    OwnedCsr { row_ptr: t_row_ptr, col_idx: t_col_idx, values: t_values, n_cols: n_rows }
+}
+
+/// Compute the Galerkin coarse operator A_H = Pᵀ · A_h · P via sequential SpMM.
+///
+/// Steps:
+///   1. Materialize P as an explicit CSR matrix  (N_fine × N_coarse).
+///   2. T   = A_h · P                            (N_fine × N_coarse).
+///   3. Pᵀ  = transpose(P)                       (N_coarse × N_fine).
+///   4. A_H = Pᵀ · T                             (N_coarse × N_coarse).
+///
+/// A_H is SPD whenever A_h is SPD because R = Pᵀ (unscaled) guarantees
+/// ⟨A_H·v, v⟩ = ⟨A_h·Pv, Pv⟩ ≥ 0 with equality only at v = 0
+/// (P has full column rank for any reasonable grid).
+///
+/// Panics if a_h dimensions are inconsistent with p.
+pub fn galerkin_triple_product(a_h: &OwnedCsr, p: &Prolongation) -> OwnedCsr {
+    let n_fine   = 3 * p.nx * p.ny * p.nz;
+    let n_coarse = 3 * p.cx * p.cy * p.cz;
+    assert_eq!(a_h.n_rows(), n_fine,
+        "A_h has {} rows but prolongation expects {} fine DOFs",
+        a_h.n_rows(), n_fine);
+    assert_eq!(a_h.n_cols, n_fine,
+        "A_h must be square: {} rows but n_cols={}",
+        a_h.n_rows(), a_h.n_cols);
+
+    // Step 1 — explicit P in CSR.
+    let p_csr = materialize_p_csr(p);
+
+    // Step 2 — T = A_h · P.
+    let t = spmatmat(
+        &a_h.row_ptr, &a_h.col_idx, &a_h.values,
+        &p_csr.row_ptr, &p_csr.col_idx, &p_csr.values,
+        n_coarse,
+    );
+
+    // Step 3 — Pᵀ.
+    let pt = transpose_csr(
+        &p_csr.row_ptr, &p_csr.col_idx, &p_csr.values,
+        n_fine, n_coarse,
+    );
+
+    // Step 4 — A_H = Pᵀ · T.
+    spmatmat(
+        &pt.row_ptr, &pt.col_idx, &pt.values,
+        &t.row_ptr,  &t.col_idx,  &t.values,
+        n_coarse,
+    )
+}
+
+// ── Level hierarchy ───────────────────────────────────────────────────────
+
+/// DOF count at which the hierarchy terminates and Phase 6 applies a direct
+/// (or heavily-iterated CG) coarse-grid solve. 512 ≈ 5×5×5 nodes × 3 DOFs.
+/// Adjust upward if the direct solve in Phase 6 is too slow at this size.
+pub const COARSEST_DOFS: usize = 512;
+
+/// One level in the Galerkin multigrid hierarchy.
+///
+/// `p` and `r` are the transfer operators to/from the **next coarser** level.
+/// At the coarsest level they are still present (cx/cy/cz are nonzero) but
+/// are never called by the V-cycle — the V-cycle detects the coarsest level
+/// by index, not by the absence of p/r.
+pub struct GridLevel {
+    /// Stiffness operator at this level.
+    pub a:  OwnedCsr,
+    /// Prolongation to next-finer level (used by V-cycle post-correction).
+    pub p:  Prolongation,
+    /// Restriction to next-coarser level (used by V-cycle pre-residual transfer).
+    pub r:  Restriction,
+    /// Node counts at this level.
+    pub nx: usize,
+    pub ny: usize,
+    pub nz: usize,
+}
+
+/// Full Galerkin multigrid level hierarchy.
+///
+/// `levels[0]` = finest, `levels[L-1]` = coarsest (≤ COARSEST_DOFS DOFs).
+/// Built once per SIMP iteration (A_h changes every iteration).
+/// The V-cycle (Phase 5) indexes into `levels[k]` for smoothing and uses
+/// `levels[k].p` / `levels[k].r` for inter-level transfer.
+pub struct GalerkinHierarchy {
+    pub levels: Vec<GridLevel>,
+}
+
+impl GalerkinHierarchy {
+    /// Build the complete level hierarchy from the fine-grid stiffness matrix.
+    ///
+    /// `nx`, `ny`, `nz`  — **node** counts on the fine grid (n_elem_x + 1, etc.).
+    /// `max_levels`       — hard cap on depth; COARSEST_DOFS terminates earlier
+    ///                      on typical grids.
+    ///
+    /// The fine matrix is accepted as raw slices matching `cg_solve_direct`'s
+    /// signature so the caller does not need to construct OwnedCsr.
+    pub fn build(
+        a_rows:     &[usize],
+        a_cols:     &[usize],
+        a_vals:     &[f64],
+        nx:         usize,
+        ny:         usize,
+        nz:         usize,
+        max_levels: usize,
+    ) -> Self {
+        assert!(max_levels >= 1);
+        let n_fine = a_rows.len() - 1;
+        assert_eq!(n_fine, 3 * nx * ny * nz,
+            "matrix has {n_fine} rows but 3·{nx}·{ny}·{nz}={} expected",
+            3 * nx * ny * nz);
+
+        let a_fine = OwnedCsr {
+            row_ptr: a_rows.to_vec(),
+            col_idx: a_cols.to_vec(),
+            values:  a_vals.to_vec(),
+            n_cols:  n_fine,
+        };
+
+        let mut levels: Vec<GridLevel> = Vec::with_capacity(max_levels);
+        levels.push(GridLevel {
+            p:  Prolongation::new(nx, ny, nz),
+            r:  Restriction::new(nx, ny, nz),
+            a:  a_fine,
+            nx, ny, nz,
+        });
+
+        for _ in 1..max_levels {
+            // Extract coarse dimensions from the current-finest level's P.
+            // Done in a scoped block so the immutable borrow ends before push().
+            let (cx, cy, cz) = {
+                let last = levels.last().unwrap();
+                (last.p.cx, last.p.cy, last.p.cz)
+            };
+
+            // Build A_H = Pᵀ A_h P. Borrow ends when this block exits.
+            let a_coarse = {
+                let last = levels.last().unwrap();
+                galerkin_triple_product(&last.a, &last.p)
+            };
+
+            levels.push(GridLevel {
+                p:  Prolongation::new(cx, cy, cz),
+                r:  Restriction::new(cx, cy, cz),
+                a:  a_coarse,
+                nx: cx,
+                ny: cy,
+                nz: cz,
+            });
+
+            // Terminate after pushing: the level just added is the coarsest.
+            // Checking after push (not before) ensures we always descend into
+            // a level ≤ COARSEST_DOFS rather than stopping one level above it.
+            if 3 * cx * cy * cz <= COARSEST_DOFS {
+                break;
+            }
+        }
+
+        Self { levels }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
     use super::*;
+
     // ── Test harness helpers ──────────────────────────────────────────────
+
     /// Build a trivial block-diagonal CSR: each 3×3 block is 2*I. Used for
     /// basic plumbing tests where we need a valid CSR but don't care about
     /// off-diagonal coupling.
@@ -574,7 +996,19 @@ mod tests {
         a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
     }
 
-    // ── Tests ─────────────────────────────────────────────────────────────
+    /// Wrap a raw CSR triple into OwnedCsr for test use.
+    /// Production code passes raw slices directly to GalerkinHierarchy::build.
+    fn owned_csr_from_triple(rows: &[usize], cols: &[usize], vals: &[f64]) -> OwnedCsr {
+        let n = rows.len() - 1;
+        OwnedCsr {
+            row_ptr: rows.to_vec(),
+            col_idx: cols.to_vec(),
+            values:  vals.to_vec(),
+            n_cols:  n,
+        }
+    }
+
+    // ── Phase 2 tests — smoother ──────────────────────────────────────────
 
     #[test]
     fn invert_3x3_identity() {
@@ -611,7 +1045,6 @@ mod tests {
                 for ix in 0..nx {
                     let node = iz * (ny * nx) + iy * nx + ix;
                     let node_red = sm.is_red(node);
-                    // Check each face-neighbor if in-grid
                     let neighbors = [
                         (ix as isize - 1, iy as isize,     iz as isize),
                         (ix as isize + 1, iy as isize,     iz as isize),
@@ -645,12 +1078,8 @@ mod tests {
 
     #[test]
     fn smoother_monotonic_residual_reduction() {
-        // Use a 1D scalar Laplacian replicated on 3 DOFs per node. With
-        // Dirichlet-ish boundary (diag=1 at endpoints) the system is SPD
-        // and every smoothing iteration must reduce the residual norm.
         let n_nodes = 20;
         let (kr, kc, kv) = scalar_laplacian_3dof_1d(n_nodes);
-        // Pass as a 1×1×20 grid so coloring alternates along x.
         let sm = RedBlackGSSmoother::new(&kr, &kc, &kv, n_nodes, 1, 1);
 
         let n_dof = 3 * n_nodes;
@@ -675,18 +1104,6 @@ mod tests {
 
     #[test]
     fn smoother_damps_high_frequency_mode() {
-        // 3D scalar Laplacian on 8×8×8. Initialize error to a genuinely
-        // oscillatory mode — sin(k·π·x) * sin(k·π·y) * sin(k·π·z) with k
-        // near the Nyquist limit. The pure 3D checkerboard is a trivial
-        // eigenmode of RB-GS (damping factor ~1, classical MG textbook
-        // caveat) so we use sin(3π·ix/n)·sin(3π·iy/n)·sin(3π·iz/n) instead:
-        // high-frequency but not the pathological checkerboard itself.
-        //
-        // Run the homogeneous system K·x = 0 so any amplitude in x after
-        // smoothing is pure error. Measure energy norm reduction across
-        // 2 smooth() calls (= 4 color sweeps) — textbook expected
-        // reduction for RB-GS on a smooth-but-oscillatory mode is 0.3-0.5
-        // per symmetric iteration, so 2 iterations should achieve ≤ 0.5.
         use std::f64::consts::PI;
 
         let nx = 8; let ny = 8; let nz = 8;
@@ -703,9 +1120,6 @@ mod tests {
                     let val = (3.0 * PI * (ix as f64 + 0.5) / nx as f64).sin()
                             * (3.0 * PI * (iy as f64 + 0.5) / ny as f64).sin()
                             * (3.0 * PI * (iz as f64 + 0.5) / nz as f64).sin();
-                    // Load mode onto the first DOF of each node; leave
-                    // DOFs 1 and 2 zero. Since the 3D Laplacian decouples
-                    // across DOFs, the non-zero DOF evolves independently.
                     x[3 * node] = val;
                 }
             }
@@ -728,18 +1142,11 @@ mod tests {
 
     #[test]
     fn smoother_is_symmetric_operator() {
-        // The smoothing operator S maps (r, 0) -> x_out through applying
-        // smooth to zero initial guess with b=r. For S to be symmetric,
-        //   ⟨S·r, s⟩ == ⟨r, S·s⟩   for arbitrary r, s.
-        // This catches forward/backward ordering bugs that would make CG
-        // break in Phase 5.
         let n_nodes = 16;
         let (kr, kc, kv) = scalar_laplacian_3dof_1d(n_nodes);
         let sm = RedBlackGSSmoother::new(&kr, &kc, &kv, n_nodes, 1, 1);
 
         let n_dof = 3 * n_nodes;
-
-        // Two random-ish RHS vectors.
         let r: Vec<f64> = (0..n_dof).map(|i| ((i as f64 + 1.0) * 0.7).sin()).collect();
         let s: Vec<f64> = (0..n_dof).map(|i| ((i as f64 + 1.0) * 1.3).cos()).collect();
 
@@ -758,11 +1165,8 @@ mod tests {
             lhs, rhs, rel_err);
     }
 
-    // ── Transfer operator tests ───────────────────────────────────────────
+    // ── Phase 3 tests — transfer operators ───────────────────────────────
 
-    /// P · ones_coarse = ones_fine: weights per fine node sum to exactly 1.0
-    /// (partition of unity). Requires odd fine dimensions so boundary fine
-    /// nodes always coincide with a coarse node (no dropped parents).
     #[test]
     fn prolongation_preserves_constant_field() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -776,10 +1180,6 @@ mod tests {
         }
     }
 
-    /// Trilinear interpolation reproduces linear fields exactly.
-    /// Coarse values: f(ci,cj,ck) = 2*(2·ci) + 3*(2·cj) + 5*(2·ck) + (d+1).
-    /// After prolongation every fine node must satisfy f(fx,fy,fz).
-    /// This catches stencil-weight bugs that pass constant fields but fail gradients.
     #[test]
     fn prolongation_preserves_linear_field() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -814,11 +1214,6 @@ mod tests {
         }
     }
 
-    /// ⟨R·x_fine, y_coarse⟩ == ⟨x_fine, P·y_coarse⟩ to 1e-13 across 10 random pairs.
-    ///
-    /// This is the load-bearing test for Phase 3. If it passes, R = Pᵀ exactly and
-    /// the Phase 4 Galerkin operator A_H = Pᵀ·A_h·P is guaranteed to be SPD.
-    /// If it fails, do not proceed to Phase 4.
     #[test]
     fn restriction_is_transpose_of_prolongation() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -850,10 +1245,6 @@ mod tests {
         }
     }
 
-    /// R = Pᵀ: for interior coarse nodes the column of P sums to 8, so
-    /// R · ones_fine = 8 at those nodes. Boundary nodes receive < 8 (fewer
-    /// fine neighbours in domain) — we only check the interior here.
-    /// Grid: 9×9×9 fine → 5×5×5 coarse; interior coarse = (1..=3)³ (27 nodes).
     #[test]
     fn restriction_interior_row_sum_equals_8() {
         let (nx, ny, nz) = (9, 9, 9);
@@ -876,10 +1267,6 @@ mod tests {
         }
     }
 
-    /// R·P acts as 8·I on smooth (non-oscillatory) inputs at interior coarse nodes.
-    /// Constant fields are maximally smooth: P·ones_coarse = ones_fine exactly
-    /// (partition of unity), then R·ones_fine = 8·ones_coarse at interior nodes.
-    /// This validates the composition without needing the V-cycle loop from Phase 5.
     #[test]
     fn prolongate_then_restrict_constant_field_gives_8x() {
         let (nx, ny, nz) = (9, 9, 9);
@@ -902,6 +1289,137 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ── Phase 4 tests — Galerkin coarse operator ──────────────────────────
+
+    /// All diagonal entries of A_H must be strictly positive.
+    /// Necessary condition for SPD. Catches sign errors and structurally
+    /// zero rows from a malformed P or an off-by-one in the scatter.
+    #[test]
+    fn galerkin_diagonal_all_positive() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let a_h     = owned_csr_from_triple(&kr, &kc, &kv);
+        let p       = Prolongation::new(nx, ny, nz);
+        let a_big_h = galerkin_triple_product(&a_h, &p);
+
+        for (i, d) in a_big_h.diagonal().iter().enumerate() {
+            assert!(*d > 0.0,
+                "A_H diagonal[{i}] = {d:.6e} is not positive");
+        }
+    }
+
+    /// A_H must be symmetric: A_H[i,j] == A_H[j,i].
+    /// Algebraically guaranteed by (PᵀA_hP)ᵀ = PᵀA_hᵀP = PᵀA_hP when A_h
+    /// is symmetric. A numerical failure here means spmatmat or transpose_csr
+    /// has an index bug, not a floating-point cancellation issue.
+    #[test]
+    fn galerkin_is_symmetric() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let a_h     = owned_csr_from_triple(&kr, &kc, &kv);
+        let p       = Prolongation::new(nx, ny, nz);
+        let a_big_h = galerkin_triple_product(&a_h, &p);
+
+        let n = a_big_h.n_rows();
+        // 20 pseudo-random (i,j) pairs spanning the index space.
+        for t in 0..20_usize {
+            let i = (t * 37 +  3) % n;
+            let j = (t * 53 + 11) % n;
+            let aij = a_big_h.get(i, j);
+            let aji = a_big_h.get(j, i);
+            let scale = aij.abs().max(aji.abs()).max(1e-30);
+            let rel   = (aij - aji).abs() / scale;
+            assert!(rel < 1e-10,
+                "A_H[{i},{j}]={aij:.10e}  A_H[{j},{i}]={aji:.10e}  rel={rel:.3e}");
+        }
+    }
+
+    /// Load-bearing Galerkin condition: ⟨A_H·v_H, v_H⟩ == ⟨A_h·Pv_H, Pv_H⟩.
+    ///
+    /// This is the defining property of the Galerkin coarse operator in
+    /// falsifiable form. Diagonal positivity and symmetry can both pass while
+    /// the off-diagonal structure is wrong; the energy identity catches
+    /// everything because it involves the full matrix action via matvec.
+    /// Tolerance 1e-10 relative.
+    #[test]
+    fn galerkin_energy_matches_fine() {
+        let (nx, ny, nz) = (5, 5, 5);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let a_h     = owned_csr_from_triple(&kr, &kc, &kv);
+        let p       = Prolongation::new(nx, ny, nz);
+        let a_big_h = galerkin_triple_product(&a_h, &p);
+
+        let n_coarse = 3 * p.cx * p.cy * p.cz;
+        let n_fine   = 3 * nx * ny * nz;
+
+        // Smooth coarse test vector: linear ramp so it has nontrivial energy
+        // on both fine and coarse grids.
+        let v_h: Vec<f64> = (0..n_coarse).map(|i| (i as f64 + 1.0) * 0.1).collect();
+
+        // LHS = v_H · (A_H · v_H)
+        let mut a_h_v = vec![0.0_f64; n_coarse];
+        a_big_h.matvec(&v_h, &mut a_h_v);
+        let lhs: f64 = v_h.iter().zip(a_h_v.iter()).map(|(a, b)| a * b).sum();
+
+        // RHS = (Pv_H) · (A_h · Pv_H)
+        let mut pv = vec![0.0_f64; n_fine];
+        p.apply(&v_h, &mut pv);
+        let a_h_pv = csr_matvec(&kr, &kc, &kv, &pv);
+        let rhs: f64 = pv.iter().zip(a_h_pv.iter()).map(|(a, b)| a * b).sum();
+
+        let scale = lhs.abs().max(rhs.abs()).max(1e-30);
+        let rel   = (lhs - rhs).abs() / scale;
+        assert!(rel < 1e-10,
+            "Galerkin energy: ⟨A_H·v,v⟩={lhs:.12e}  ⟨A_h·Pv,Pv⟩={rhs:.12e}  rel={rel:.3e}");
+    }
+
+    /// Build a two-level hierarchy and verify all-positive diagonals at every level.
+    /// Exercises GalerkinHierarchy::build at depth — Phase 5 V-cycle requires it.
+    ///
+    /// Grid: 9×9×9 fine (2187 DOFs) → 5×5×5 coarse (375 DOFs ≤ 512 → terminates).
+    #[test]
+    fn galerkin_hierarchy_two_levels() {
+        let (nx, ny, nz) = (9, 9, 9);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+
+        let hier = GalerkinHierarchy::build(&kr, &kc, &kv, nx, ny, nz, 4);
+
+        assert!(hier.levels.len() >= 2,
+            "expected ≥2 levels, got {}", hier.levels.len());
+
+        for (lv, level) in hier.levels.iter().enumerate() {
+            for (i, d) in level.a.diagonal().iter().enumerate() {
+                assert!(*d > 0.0,
+                    "level {lv} diagonal[{i}] = {d:.6e} not positive");
+            }
+        }
+    }
+
+    /// GalerkinHierarchy::build must terminate with the coarsest level having
+    /// ≤ COARSEST_DOFS DOFs. This is the structural guarantee Phase 6 relies
+    /// on when choosing a coarse-grid solver.
+    ///
+    /// Grid: 17×17×17 fine (14739 DOFs)
+    ///   → 9×9×9  coarse (2187 DOFs)
+    ///   → 5×5×5  coarsest (375 DOFs ≤ 512, stop).
+    #[test]
+    fn galerkin_hierarchy_terminates_at_coarsest_dofs() {
+        let (nx, ny, nz) = (17, 17, 17);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+
+        let hier = GalerkinHierarchy::build(&kr, &kc, &kv, nx, ny, nz, 10);
+
+        let coarsest_n = hier.levels.last().unwrap().a.n_rows();
+        assert!(coarsest_n <= COARSEST_DOFS,
+            "coarsest level has {coarsest_n} DOFs, expected ≤ {COARSEST_DOFS}");
+
+        // Coarsest level must itself be SPD.
+        for (i, d) in hier.levels.last().unwrap().a.diagonal().iter().enumerate() {
+            assert!(*d > 0.0,
+                "coarsest diagonal[{i}] = {d:.6e} not positive");
         }
     }
 }
