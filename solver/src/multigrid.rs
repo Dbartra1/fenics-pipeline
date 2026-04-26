@@ -9,7 +9,8 @@
 //! Phase 2 lands the block-symmetric red-black Gauss-Seidel smoother.
 //! Phase 3 adds restriction/prolongation transfer operators.
 //! Phase 4 adds the Galerkin coarse operator hierarchy (this phase).
-//! Later phases will add the V-cycle preconditioner (Phases 5-6).
+//! Phase 5 adds the V-cycle preconditioner (this phase).
+//! Phase 6 will wire VCyclePreconditioner into cg_solve_direct dispatch.
 //!
 //! # Smoother design — why this shape
 //!
@@ -41,6 +42,9 @@
 //! this gives near-mesh-independent convergence across the contrast range.
 
 use rayon::prelude::*;
+use std::sync::Mutex;
+use crate::preconditioner::{JacobiPreconditioner, Preconditioner};
+use crate::solver::cg_solve_with_precond;
 
 /// Red-black block Gauss-Seidel smoother for 3D elasticity on a structured
 /// hex grid.
@@ -855,6 +859,264 @@ impl GalerkinHierarchy {
     }
 }
 
+// ── V-cycle preconditioner (Phase 5) ─────────────────────────────────────
+
+/// Per-level scratch buffers. Allocated once in `VCyclePreconditioner::new`;
+/// never reallocated during `apply`.
+///
+/// Index mapping for a hierarchy with L levels:
+///
+///   work_x[i]   — DOF vector (initial guess / accumulated correction) at
+///                 level i+1.  Size = 3·levels[i].p.cx·cy·cz.
+///                 Cleared to zero at the start of each descent step.
+///
+///   work_b[i]   — Right-hand side at level i+1, produced by restricting
+///                 the residual from level i.  Same size as work_x[i].
+///
+///   work_res[i] — Residual scratch at level i.  Size = levels[i].a.n_rows().
+///                 Reused as the prolongation output buffer during ascent,
+///                 which is safe because the descent residual is consumed
+///                 before the corresponding ascent step writes here.
+///
+/// All three are separate struct fields so the borrow checker (NLL) can
+/// split them across simultaneous borrows inside the V-cycle loops without
+/// requiring `split_at_mut`.  Never merge these fields.
+struct VCycleWork {
+    work_x:   Vec<Vec<f64>>,
+    work_b:   Vec<Vec<f64>>,
+    work_res: Vec<Vec<f64>>,
+}
+
+/// Geometric multigrid V-cycle preconditioner.
+///
+/// Implements [`Preconditioner`] and is passed directly to
+/// [`cg_solve_with_precond`].  One V-cycle application approximates M⁻¹·r
+/// where M is the GMG operator built from the Galerkin hierarchy.
+///
+/// # Symmetry guarantee
+///
+/// The V-cycle is a symmetric linear operator because:
+/// (a) The smoother performs a forward + backward RB-GS sweep per `smooth`
+///     call (Phase 2) — symmetric by construction.
+/// (b) The same `nu` is used for pre- and post-smoothing — equal weights.
+/// (c) Restriction = Pᵀ exactly (Phase 3) — Galerkin consistency.
+///
+/// CG correctness therefore does not require a runtime symmetry check; it
+/// is structural.  The test `vcycle_is_symmetric_operator` verifies this
+/// numerically as a regression guard.
+///
+/// # Allocation contract
+///
+/// All buffers are allocated in `new`.  `apply` acquires the Mutex once and
+/// does not allocate.  The `Mutex` is required (not `RefCell`) because the
+/// `Preconditioner` trait requires `Sync`.  In normal single-threaded PCG
+/// usage the lock is always uncontested.
+pub struct VCyclePreconditioner {
+    hierarchy:      GalerkinHierarchy,
+    /// One smoother per level (finest to coarsest).  The coarsest-level
+    /// smoother is built but not called — coarse solve uses Jacobi-PCG.
+    smoothers:      Vec<RedBlackGSSmoother>,
+    /// Jacobi preconditioner for the inner coarse-grid CG solve.
+    coarse_precond: JacobiPreconditioner,
+    /// Symmetric smoothing sweeps applied before and after each coarse
+    /// correction.  ν=2 is the standard starting point.
+    nu:             usize,
+    work:           Mutex<VCycleWork>,
+}
+
+impl VCyclePreconditioner {
+    /// Build from the same CSR slices and node-count triple accepted by
+    /// `cg_solve_direct`.  `nx`, `ny`, `nz` are **node** counts
+    /// (`n_elem + 1`), not element counts.
+    ///
+    /// `nu = 2` is conservative and correct.  Drop to `nu = 1` only after
+    /// profiling confirms smoother cost dominates and convergence holds.
+    /// `max_levels = 8` is a safe production cap.
+    pub fn new(
+        k_rows:     &[usize],
+        k_cols:     &[usize],
+        k_vals:     &[f64],
+        nx:         usize,
+        ny:         usize,
+        nz:         usize,
+        nu:         usize,
+        max_levels: usize,
+    ) -> Self {
+        let hierarchy = GalerkinHierarchy::build(
+            k_rows, k_cols, k_vals, nx, ny, nz, max_levels,
+        );
+        let l_count = hierarchy.levels.len();
+
+        // ── One smoother per level ────────────────────────────────────────
+        // The coarsest-level smoother is constructed but never called by the
+        // V-cycle (the coarse solve uses Jacobi-PCG instead).  Building it
+        // here keeps the indexing uniform and costs little at ≤512 DOFs.
+        let smoothers: Vec<RedBlackGSSmoother> = hierarchy.levels.iter()
+            .map(|lv| RedBlackGSSmoother::new(
+                &lv.a.row_ptr, &lv.a.col_idx, &lv.a.values,
+                lv.nx, lv.ny, lv.nz,
+            ))
+            .collect();
+
+        // ── Jacobi preconditioner for coarse-grid CG ─────────────────────
+        let coarse = &hierarchy.levels[l_count - 1];
+        let coarse_precond = JacobiPreconditioner::new(
+            &coarse.a.row_ptr, &coarse.a.col_idx, &coarse.a.values,
+        );
+
+        // ── Work buffers ──────────────────────────────────────────────────
+        // n_transfer = L - 1 slots, one per inter-level gap.
+        let n_transfer = l_count.saturating_sub(1);
+        let mut work_x   = Vec::with_capacity(n_transfer);
+        let mut work_b   = Vec::with_capacity(n_transfer);
+        let mut work_res = Vec::with_capacity(n_transfer);
+
+        for i in 0..n_transfer {
+            // levels[i].p maps level i (fine) → level i+1 (coarse).
+            // cx/cy/cz on that Prolongation are the node counts at level i+1.
+            let n_coarse = 3 * hierarchy.levels[i].p.cx
+                             * hierarchy.levels[i].p.cy
+                             * hierarchy.levels[i].p.cz;
+            work_x.push(vec![0.0f64; n_coarse]);
+            work_b.push(vec![0.0f64; n_coarse]);
+
+            // Residual scratch at level i: same DOF count as levels[i].a.
+            let n_level_i = hierarchy.levels[i].a.n_rows();
+            work_res.push(vec![0.0f64; n_level_i]);
+        }
+
+        Self {
+            hierarchy,
+            smoothers,
+            coarse_precond,
+            nu,
+            work: Mutex::new(VCycleWork { work_x, work_b, work_res }),
+        }
+    }
+}
+
+impl Preconditioner for VCyclePreconditioner {
+    /// Apply one V-cycle: `z ← M_GMG⁻¹ · r`.
+    ///
+    /// Does not allocate.  Acquires the work-buffer Mutex once per call.
+    ///
+    /// # Buffer index convention (L = hierarchy level count)
+    ///
+    ///   Level 0 (finest):  x = caller's z,      b = caller's r
+    ///   Level k (k > 0):   x = work_x[k-1],     b = work_b[k-1]
+    ///   Residual at k:          work_res[k]       (also reused as prolongation temp)
+    fn apply(&self, r: &[f64], z: &mut [f64]) {
+        debug_assert_eq!(r.len(), z.len());
+        let l_count = self.hierarchy.levels.len();
+        z.iter_mut().for_each(|v| *v = 0.0);
+
+        // ── Degenerate single-level case ──────────────────────────────────
+        // No V-cycle structure; just apply a direct Jacobi-PCG solve.
+        // Work buffers are empty (n_transfer = 0) so no indexing below.
+        if l_count == 1 {
+            let lv = &self.hierarchy.levels[0];
+            let _ = cg_solve_with_precond(
+                &lv.a.row_ptr, &lv.a.col_idx, &lv.a.values,
+                r, z, 1e-10, 1000, &self.coarse_precond,
+            );
+            return;
+        }
+
+        // Acquire once; destructure into three independent &mut bindings so
+        // the borrow checker can see field-level independence throughout the
+        // loops below.  No split_at_mut needed anywhere.
+        let mut guard = self.work.lock().expect("VCycleWork Mutex poisoned");
+        let VCycleWork { work_x, work_b, work_res } = &mut *guard;
+
+        // ══ DESCENT ══════════════════════════════════════════════════════
+        //
+        // Level 0 (finest): x = z, b = r.
+
+        for _ in 0..self.nu {
+            self.smoothers[0].smooth(z, r);
+        }
+        // Residual at level 0: work_res[0] = r - A[0]·z
+        self.hierarchy.levels[0].a.matvec(z, &mut work_res[0]);
+        for i in 0..r.len() {
+            work_res[0][i] = r[i] - work_res[0][i];
+        }
+        // Restrict residual → rhs at level 1.
+        self.hierarchy.levels[0].r.apply(&work_res[0], &mut work_b[0]);
+        work_x[0].iter_mut().for_each(|v| *v = 0.0);
+
+        // Levels 1 .. L-2 (the inner levels; empty range when L == 2).
+        //
+        // At level l: x = work_x[l-1], b = work_b[l-1].
+        for l in 1..l_count - 1 {
+            for _ in 0..self.nu {
+                self.smoothers[l].smooth(&mut work_x[l - 1], &work_b[l - 1]);
+            }
+            // Residual at level l: work_res[l] = work_b[l-1] - A[l]·work_x[l-1].
+            // matvec writes y[i] = s (not +=), so no pre-zero needed.
+            self.hierarchy.levels[l].a.matvec(&work_x[l - 1], &mut work_res[l]);
+            // Subtract in a separate pass to avoid a simultaneous shared +
+            // exclusive borrow of work_res[l] within one expression.
+            let b_len = work_b[l - 1].len();
+            for i in 0..b_len {
+                let az_i = work_res[l][i];
+                work_res[l][i] = work_b[l - 1][i] - az_i;
+            }
+            // Restrict residual → rhs at level l+1.
+            self.hierarchy.levels[l].r.apply(&work_res[l], &mut work_b[l]);
+            work_x[l].iter_mut().for_each(|v| *v = 0.0);
+        }
+
+        // ══ COARSE SOLVE ═════════════════════════════════════════════════
+        //
+        // Solve A[L-1] · work_x[L-2] = work_b[L-2] to tight tolerance.
+        // The coarse grid has ≤ COARSEST_DOFS DOFs so Jacobi-PCG converges
+        // quickly and the cost is negligible relative to the fine-grid sweeps.
+        {
+            let lv = &self.hierarchy.levels[l_count - 1];
+            let _ = cg_solve_with_precond(
+                &lv.a.row_ptr, &lv.a.col_idx, &lv.a.values,
+                &work_b[l_count - 2],
+                &mut work_x[l_count - 2],
+                1e-10, 1000,
+                &self.coarse_precond,
+            );
+        }
+
+        // ══ ASCENT ═══════════════════════════════════════════════════════
+        //
+        // Levels L-2 down to 1 (empty range when L == 2).
+        //
+        // At level l: correction lives in work_x[l] (= x at level l+1).
+        // Prolongate it into work_res[l] (size = levels[l] DOFs = fine side
+        // of levels[l].p), accumulate into work_x[l-1] (= x at level l),
+        // then post-smooth.
+        for l in (1..l_count - 1).rev() {
+            // Prolongate correction at level l+1 into level-l scratch.
+            // work_x[l]:   source, size = n_coarse for levels[l].p  ✓
+            // work_res[l]: dest,   size = levels[l].a.n_rows()       ✓
+            self.hierarchy.levels[l].p.apply(&work_x[l], &mut work_res[l]);
+            // Accumulate into x at level l (work_x[l-1]).
+            let n = work_res[l].len();
+            for i in 0..n {
+                work_x[l - 1][i] += work_res[l][i];
+            }
+            for _ in 0..self.nu {
+                self.smoothers[l].smooth(&mut work_x[l - 1], &work_b[l - 1]);
+            }
+        }
+
+        // Level 0 ascent: prolongate level-1 correction (work_x[0]) into z.
+        // Reuse work_res[0] as the prolongation output (fine side = n DOFs).
+        self.hierarchy.levels[0].p.apply(&work_x[0], &mut work_res[0]);
+        for i in 0..z.len() {
+            z[i] += work_res[0][i];
+        }
+        for _ in 0..self.nu {
+            self.smoothers[0].smooth(z, r);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -1294,9 +1556,6 @@ mod tests {
 
     // ── Phase 4 tests — Galerkin coarse operator ──────────────────────────
 
-    /// All diagonal entries of A_H must be strictly positive.
-    /// Necessary condition for SPD. Catches sign errors and structurally
-    /// zero rows from a malformed P or an off-by-one in the scatter.
     #[test]
     fn galerkin_diagonal_all_positive() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -1311,10 +1570,6 @@ mod tests {
         }
     }
 
-    /// A_H must be symmetric: A_H[i,j] == A_H[j,i].
-    /// Algebraically guaranteed by (PᵀA_hP)ᵀ = PᵀA_hᵀP = PᵀA_hP when A_h
-    /// is symmetric. A numerical failure here means spmatmat or transpose_csr
-    /// has an index bug, not a floating-point cancellation issue.
     #[test]
     fn galerkin_is_symmetric() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -1324,7 +1579,6 @@ mod tests {
         let a_big_h = galerkin_triple_product(&a_h, &p);
 
         let n = a_big_h.n_rows();
-        // 20 pseudo-random (i,j) pairs spanning the index space.
         for t in 0..20_usize {
             let i = (t * 37 +  3) % n;
             let j = (t * 53 + 11) % n;
@@ -1337,13 +1591,6 @@ mod tests {
         }
     }
 
-    /// Load-bearing Galerkin condition: ⟨A_H·v_H, v_H⟩ == ⟨A_h·Pv_H, Pv_H⟩.
-    ///
-    /// This is the defining property of the Galerkin coarse operator in
-    /// falsifiable form. Diagonal positivity and symmetry can both pass while
-    /// the off-diagonal structure is wrong; the energy identity catches
-    /// everything because it involves the full matrix action via matvec.
-    /// Tolerance 1e-10 relative.
     #[test]
     fn galerkin_energy_matches_fine() {
         let (nx, ny, nz) = (5, 5, 5);
@@ -1355,16 +1602,12 @@ mod tests {
         let n_coarse = 3 * p.cx * p.cy * p.cz;
         let n_fine   = 3 * nx * ny * nz;
 
-        // Smooth coarse test vector: linear ramp so it has nontrivial energy
-        // on both fine and coarse grids.
         let v_h: Vec<f64> = (0..n_coarse).map(|i| (i as f64 + 1.0) * 0.1).collect();
 
-        // LHS = v_H · (A_H · v_H)
         let mut a_h_v = vec![0.0_f64; n_coarse];
         a_big_h.matvec(&v_h, &mut a_h_v);
         let lhs: f64 = v_h.iter().zip(a_h_v.iter()).map(|(a, b)| a * b).sum();
 
-        // RHS = (Pv_H) · (A_h · Pv_H)
         let mut pv = vec![0.0_f64; n_fine];
         p.apply(&v_h, &mut pv);
         let a_h_pv = csr_matvec(&kr, &kc, &kv, &pv);
@@ -1376,10 +1619,6 @@ mod tests {
             "Galerkin energy: ⟨A_H·v,v⟩={lhs:.12e}  ⟨A_h·Pv,Pv⟩={rhs:.12e}  rel={rel:.3e}");
     }
 
-    /// Build a two-level hierarchy and verify all-positive diagonals at every level.
-    /// Exercises GalerkinHierarchy::build at depth — Phase 5 V-cycle requires it.
-    ///
-    /// Grid: 9×9×9 fine (2187 DOFs) → 5×5×5 coarse (375 DOFs ≤ 512 → terminates).
     #[test]
     fn galerkin_hierarchy_two_levels() {
         let (nx, ny, nz) = (9, 9, 9);
@@ -1398,13 +1637,6 @@ mod tests {
         }
     }
 
-    /// GalerkinHierarchy::build must terminate with the coarsest level having
-    /// ≤ COARSEST_DOFS DOFs. This is the structural guarantee Phase 6 relies
-    /// on when choosing a coarse-grid solver.
-    ///
-    /// Grid: 17×17×17 fine (14739 DOFs)
-    ///   → 9×9×9  coarse (2187 DOFs)
-    ///   → 5×5×5  coarsest (375 DOFs ≤ 512, stop).
     #[test]
     fn galerkin_hierarchy_terminates_at_coarsest_dofs() {
         let (nx, ny, nz) = (17, 17, 17);
@@ -1416,10 +1648,132 @@ mod tests {
         assert!(coarsest_n <= COARSEST_DOFS,
             "coarsest level has {coarsest_n} DOFs, expected ≤ {COARSEST_DOFS}");
 
-        // Coarsest level must itself be SPD.
         for (i, d) in hier.levels.last().unwrap().a.diagonal().iter().enumerate() {
             assert!(*d > 0.0,
                 "coarsest diagonal[{i}] = {d:.6e} not positive");
         }
+    }
+
+    // ── Phase 5 tests — V-cycle preconditioner ────────────────────────────
+
+    /// One V-cycle application must reduce ‖r - A·z‖ relative to ‖r‖ on a
+    /// 9×9×9 block Laplacian.  This is the minimum correctness bar: the
+    /// V-cycle must be a reduction operator, not a random perturbation.
+    #[test]
+    fn vcycle_reduces_residual_one_application() {
+        let (nx, ny, nz) = (9, 9, 9);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let n = kr.len() - 1;
+
+        let vc = VCyclePreconditioner::new(&kr, &kc, &kv, nx, ny, nz, 2, 8);
+
+        let r = vec![1.0f64; n];
+        let mut z = vec![0.0f64; n];
+        vc.apply(&r, &mut z);
+
+        // ‖r - A·z‖ via inline CSR matvec.
+        let mut az = vec![0.0f64; n];
+        for row in 0..n {
+            for k in kr[row]..kr[row + 1] {
+                az[row] += kv[k] * z[kc[k]];
+            }
+        }
+        let res_norm: f64 = r.iter().zip(&az)
+            .map(|(ri, azi)| (ri - azi).powi(2)).sum::<f64>().sqrt();
+        let r_norm: f64 = r.iter().map(|v| v * v).sum::<f64>().sqrt();
+
+        assert!(
+            res_norm < r_norm,
+            "V-cycle did not reduce residual: ‖r - A·Vr‖={res_norm:.3e} ≥ ‖r‖={r_norm:.3e}"
+        );
+    }
+
+    /// ⟨V·r, s⟩ = ⟨r, V·s⟩ to within 1e-8 relative error.
+    ///
+    /// Tolerance is 1e-8 rather than 1e-10 because the inner coarse-grid CG
+    /// solve (tol=1e-10) introduces a small asymmetry at the level of its
+    /// own residual — well below 1e-8 and irrelevant for CG convergence.
+    #[test]
+    fn vcycle_is_symmetric_operator() {
+        let (nx, ny, nz) = (9, 9, 9);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let n = kr.len() - 1;
+
+        let vc = VCyclePreconditioner::new(&kr, &kc, &kv, nx, ny, nz, 2, 8);
+
+        // Deterministic pseudo-random test vectors — same pattern as
+        // smoother_is_symmetric_operator to keep test philosophy uniform.
+        let r: Vec<f64> = (0..n)
+            .map(|i| ((i.wrapping_mul(6271).wrapping_add(13)) % 100) as f64 / 50.0 - 1.0)
+            .collect();
+        let s: Vec<f64> = (0..n)
+            .map(|i| ((i.wrapping_mul(3137).wrapping_add(7)) % 100) as f64 / 50.0 - 1.0)
+            .collect();
+
+        let mut vr = vec![0.0f64; n];
+        let mut vs = vec![0.0f64; n];
+        vc.apply(&r, &mut vr);
+        vc.apply(&s, &mut vs);
+
+        let vr_s: f64 = vr.iter().zip(&s).map(|(a, b)| a * b).sum();
+        let r_vs: f64 = r.iter().zip(&vs).map(|(a, b)| a * b).sum();
+        let scale = vr_s.abs().max(r_vs.abs()).max(1e-30);
+        let rel_err = (vr_s - r_vs).abs() / scale;
+
+        assert!(
+            rel_err < 1e-8,
+            "V-cycle not symmetric: ⟨Vr,s⟩={vr_s:.15e} ⟨r,Vs⟩={r_vs:.15e} rel={rel_err:.3e}"
+        );
+    }
+
+    /// PCG with V-cycle preconditioner must converge on a 17×17×17 system
+    /// and do so in strictly fewer iterations than Jacobi-PCG at the same
+    /// tolerance.  The iteration-count comparison is the falsifiable claim
+    /// that the multigrid infrastructure is actually doing useful work.
+    #[test]
+    fn cg_with_vcycle_precond_converges_faster_than_jacobi() {
+        use crate::preconditioner::JacobiPreconditioner;
+        use crate::solver::cg_solve_with_precond;
+
+        let (nx, ny, nz) = (17, 17, 17);
+        let (kr, kc, kv) = scalar_laplacian_3dof_3d(nx, ny, nz);
+        let n = kr.len() - 1;
+
+        // Non-trivial rhs that avoids accidental fast convergence from symmetry.
+        let f: Vec<f64> = (0..n).map(|i| (i % 7) as f64 - 3.0).collect();
+        let tol      = 1e-8;
+        let max_iter = 10_000;
+
+        // ── Jacobi baseline ───────────────────────────────────────────────
+        let jacobi = JacobiPreconditioner::new(&kr, &kc, &kv);
+        let mut u_jacobi = vec![0.0f64; n];
+        let res_jacobi = cg_solve_with_precond(
+            &kr, &kc, &kv, &f, &mut u_jacobi, tol, max_iter, &jacobi,
+        );
+        assert!(
+            res_jacobi.rel_residual < tol,
+            "Jacobi baseline did not converge ({} iters, rel_res={:.3e}) — \
+             test precondition violated",
+            res_jacobi.iterations, res_jacobi.rel_residual,
+        );
+
+        // ── V-cycle PCG ───────────────────────────────────────────────────
+        let vc = VCyclePreconditioner::new(&kr, &kc, &kv, nx, ny, nz, 2, 8);
+        let mut u_vc = vec![0.0f64; n];
+        let res_vc = cg_solve_with_precond(
+            &kr, &kc, &kv, &f, &mut u_vc, tol, max_iter, &vc,
+        );
+
+        assert!(
+            res_vc.rel_residual < tol,
+            "V-cycle PCG did not converge: {} iters, rel_res={:.3e}",
+            res_vc.iterations, res_vc.rel_residual,
+        );
+        assert!(
+            res_vc.iterations < res_jacobi.iterations,
+            "V-cycle PCG ({} iters) not faster than Jacobi ({} iters) — \
+             multigrid should dominate on a 17³ block Laplacian",
+            res_vc.iterations, res_jacobi.iterations,
+        );
     }
 }
