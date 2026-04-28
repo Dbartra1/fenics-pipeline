@@ -222,15 +222,14 @@ pub fn cg_solve_with_precond(
 
 // ─── GPU-accelerated CG (compiled only with --features gpu) ──────────────────
 
-/// ILU(0)-preconditioned CG using GPU SpMV + GPU triangular solves.
+/// Delegates the entire CG loop to GpuK::cg_solve_persistent().
 ///
-/// Per CG iteration:
-///   1. kp = K·p       — GPU SpMV via gpu_k.matvec()
-///   2. z  = M⁻¹·r     — GPU fwd/bwd triangular solves via gpu_k.precondition()
+/// Session 2 change: the hand-rolled CPU-orchestrated loop (4 full-vector
+/// H2D/D2H transfers per iteration) is replaced by a single call that keeps
+/// all CG state GPU-resident.  Only 3 scalar D2H per iteration (DDOT results
+/// for α, β, convergence) plus one full D2H at exit for u.
 ///
-/// Falls back to Jacobi on preconditioner error (triangular solve failure
-/// indicates structural singularity in ILU factor — rare but possible when
-/// ρ_min elements produce near-zero pivots).
+/// Timing is logged to stderr so per-solve cost is visible in notebook output.
 #[cfg(feature = "gpu")]
 fn gpu_cg_solve(
     gpu_k:    &crate::gpu_solver::GpuK,
@@ -239,70 +238,16 @@ fn gpu_cg_solve(
     tol:      f64,
     max_iter: usize,
 ) -> CgResult {
-    let n      = f.len();
-    let f_norm = dot(f, f).sqrt().max(1e-30);
-    let diag   = &gpu_k.diag;   // Jacobi diagonal — fallback only
-
-    // Zero u — GPU CG accumulates updates in-place (u += α·p each step).
-    // Without this, reusing u from the previous SIMP iteration corrupts the
-    // solution: u_final = u_prev + u_correct instead of u_correct.
-    // Cholesky overwrites u entirely; CPU CG computes r = f - K·u to handle
-    // warm starts. GPU CG must start from u = 0.
-    for v in u.iter_mut() { *v = 0.0; }
-    let mut r  = f.to_vec();
-    let mut z  = vec![0.0_f64; n];
-    let mut kp = vec![0.0_f64; n];
-
-    // First preconditioner application: z = M⁻¹·r
-    let use_ilu = gpu_k.precondition(&r, &mut z).is_ok();
-    if !use_ilu {
-        eprintln!("[gpu] ILU precondition failed on iter 0, falling back to Jacobi");
-        for i in 0..n { z[i] = r[i] / diag[i]; }
-    }
-
-    let mut p  = z.clone();
-    let mut rz = dot(&r, &z);
-
-    let mut iterations   = 0;
-    let mut rel_residual = dot(&r, &r).sqrt() / f_norm;
-
-    for iter in 0..max_iter {
-        iterations   = iter + 1;
-        rel_residual = dot(&r, &r).sqrt() / f_norm;
-        if rel_residual < tol { break; }
-
-        // SpMV: kp = K·p
-        if let Err(e) = gpu_k.matvec(&p, &mut kp) {
-            eprintln!("[gpu] matvec iter {iter}: {e}");
-            return CgResult { iterations: iter, rel_residual: f64::INFINITY, converged: false };
-        }
-
-        let pkp = dot(&p, &kp);
-        if pkp.abs() < 1e-30 { break; }
-        let alpha = rz / pkp;
-
-        for i in 0..n {
-            u[i] += alpha * p[i];
-            r[i] -= alpha * kp[i];
-        }
-
-        // Preconditioner: z = M⁻¹·r  (ILU or Jacobi fallback)
-        if use_ilu {
-            if let Err(e) = gpu_k.precondition(&r, &mut z) {
-                eprintln!("[gpu] ILU precondition failed iter {iter}: {e}");
-                for i in 0..n { z[i] = r[i] / diag[i]; }
-            }
-        } else {
-            for i in 0..n { z[i] = r[i] / diag[i]; }
-        }
-
-        let rz_new = dot(&r, &z);
-        let beta   = rz_new / rz.max(1e-30);
-        for i in 0..n { p[i] = z[i] + beta * p[i]; }
-        rz = rz_new;
-    }
-
-    CgResult { iterations, rel_residual, converged: rel_residual < tol }
+    let t0     = std::time::Instant::now();
+    let result = gpu_k.cg_solve_persistent(f, u, tol, max_iter);
+    eprintln!(
+        "[gpu_cg] {} iters  rel_res={:.3e}  converged={}  {:.0}ms",
+        result.iterations,
+        result.rel_residual,
+        result.converged,
+        t0.elapsed().as_secs_f64() * 1000.0,
+    );
+    result
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -458,19 +403,19 @@ mod tests {
         }
     }
 
-     //── Cholesky integration test (requires sparse feature) ───────────────
-     //Uncomment after confirming faer sparse feature compiles.
-    
-     #[test]
-     fn cholesky_solves_tridiagonal_system() {
-         let (k_rows, k_cols, k_vals, f) = tridiag_system();
-         let mut u = [0.0f64; 3];
-         let result = cg_solve_direct(&k_rows, &k_cols, &k_vals, &f, &mut u, 0.0, 0);
-         assert!(result.converged, "Cholesky did not report success");
-         let expected = [2.0/7.0, 1.0/7.0, 2.0/7.0];
-         for i in 0..3 {
-             let err = (u[i] - expected[i]).abs();
-             assert!(err < 1e-10, "u[{i}]={:.8e}, expected {:.8e}", u[i], expected[i]);
-         }
-     }
+    //── Cholesky integration test (requires sparse feature) ───────────────
+    //Uncomment after confirming faer sparse feature compiles.
+
+    #[test]
+    fn cholesky_solves_tridiagonal_system() {
+        let (k_rows, k_cols, k_vals, f) = tridiag_system();
+        let mut u = [0.0f64; 3];
+        let result = cg_solve_direct(&k_rows, &k_cols, &k_vals, &f, &mut u, 0.0, 0);
+        assert!(result.converged, "Cholesky did not report success");
+        let expected = [2.0/7.0, 1.0/7.0, 2.0/7.0];
+        for i in 0..3 {
+            let err = (u[i] - expected[i]).abs();
+            assert!(err < 1e-10, "u[{i}]={:.8e}, expected {:.8e}", u[i], expected[i]);
+        }
+    }
 }

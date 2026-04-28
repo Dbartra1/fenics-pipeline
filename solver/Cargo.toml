@@ -10,9 +10,9 @@ path = "src/main.rs"
 [dependencies]
 serde      = { version = "1",    features = ["derive"] }
 serde_json = "1"
-faer = "0.19"
+faer       = "0.19"
 rayon      = "1.10"
-cudarc = { version = "0.19", features = ["cuda-12060", "cusparse", "driver", "fallback-dynamic-loading"], optional = true }
+cudarc     = { version = "0.19", features = ["cuda-12060", "cusparse", "cublas", "driver", "fallback-dynamic-loading"], optional = true }
 
 [features]
 gpu = ["cudarc"]
