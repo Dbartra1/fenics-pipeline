@@ -50,5 +50,14 @@
   "export": {
     "stl_output_dir": "outputs/meshes",
     "stl_ascii": false
+  },
+  "simp": {
+    "voxel_size_mm": 1.0,
+    "volume_fraction": 0.45,
+    "filter_radius": 3.0,
+    "max_iterations": 200,
+    "convergence_tol": 0.0005,
+    "move_limit": 0.3,
+    "penal": 3.0
   }
 }

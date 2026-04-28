@@ -37,39 +37,39 @@
       }
     },
     "nondesign_regions": [],
-  "void_regions": [],
-  "bolt_seats": [
-    {
-      "_comment": "Wall-mount bolts — M5 clearance with 5mm collar, 5mm seated depth. Only the x_min entry side (the wall plate) gets a collar; the optimizer is free to treat the x_max exit side.",
-      "type": "bolt_seat_x",
-      "centers_m": [
-        [0.010, 0.010],
-        [0.050, 0.010],
-        [0.010, 0.070],
-        [0.050, 0.070]
-      ],
-      "void_radius_m": 0.003,
-      "wall_radius_m": 0.005,
-      "seat_depth_m":  0.005,
-      "entry_seat":    true,
-      "exit_seat":     false
-    },
-    {
-      "_comment": "NEMA-17 motor-mount bolts — M3 clearance with 3mm collar, 5mm seated depth. Only the x_max exit side (motor plate) needs a collar.",
-      "type": "bolt_seat_x",
-      "centers_m": [
-        [0.0145, 0.0245],
-        [0.0455, 0.0245],
-        [0.0145, 0.0555],
-        [0.0455, 0.0555]
-      ],
-      "void_radius_m": 0.002,
-      "wall_radius_m": 0.003,
-      "seat_depth_m":  0.005,
-      "entry_seat":    false,
-      "exit_seat":     true
-    }
-  ],
+    "void_regions": [],
+    "bolt_seats": [
+      {
+        "_comment": "Wall-mount bolts — M5 clearance with 5mm collar, 5mm seated depth. Only the x_min entry side (the wall plate) gets a collar; the optimizer is free to treat the x_max exit side.",
+        "type": "bolt_seat_x",
+        "centers_m": [
+          [0.010, 0.010],
+          [0.050, 0.010],
+          [0.010, 0.070],
+          [0.050, 0.070]
+        ],
+        "void_radius_m": 0.003,
+        "wall_radius_m": 0.005,
+        "seat_depth_m":  0.005,
+        "entry_seat":    true,
+        "exit_seat":     false
+      },
+      {
+        "_comment": "NEMA-17 motor-mount bolts — M3 clearance with 3mm collar, 5mm seated depth. Only the x_max exit side (motor plate) needs a collar.",
+        "type": "bolt_seat_x",
+        "centers_m": [
+          [0.0145, 0.0245],
+          [0.0455, 0.0245],
+          [0.0145, 0.0555],
+          [0.0455, 0.0555]
+        ],
+        "void_radius_m": 0.002,
+        "wall_radius_m": 0.003,
+        "seat_depth_m":  0.005,
+        "entry_seat":    false,
+        "exit_seat":     true
+      }
+    ],
     "boundary_conditions": {
       "fixed_face": "left",
       "load_face": "right",
@@ -80,5 +80,14 @@
     "export": {
       "stl_output_dir": "outputs/meshes",
       "stl_ascii": false
+    },
+    "simp": {
+      "voxel_size_mm": 1.0,
+      "volume_fraction": 0.45,
+      "filter_radius": 3.0,
+      "max_iterations": 200,
+      "convergence_tol": 0.0005,
+      "move_limit": 0.3,
+      "penal": 3.0
     }
   }
