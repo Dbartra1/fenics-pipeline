@@ -1,0 +1,67 @@
+{
+    "_comment": "Connecting rod — large bore fixed (x_min), small bore loaded (x_max), axial compression.",
+    "part_name": "conrod",
+    "geometry": {
+      "length": 120.0,
+      "width": 40.0,
+      "height": 20.0,
+      "large_bore_d": 20.0,
+      "small_bore_d": 12.0,
+      "bore_inset": 20.0,
+      "wall_thickness": 3.0,
+      "fillet_radius": 2.0
+    },
+    "mesh_hints": {
+      "target_element_size": 8.0,
+      "opt_domain_element_size_mm": 2.5,
+      "refinement_regions": []
+    },
+    "load_hints": {
+      "primary_face": "x_max",
+      "load_magnitude_n": 15000.0
+    },
+    "load_case": {
+      "fixed": {
+        "face": "x_min",
+        "selector": "center_disk",
+        "inset_m": 0.0,
+        "disk_radius_m": 0.014
+      },
+      "load": {
+        "face": "x_max",
+        "selector": "center_disk",
+        "direction": [1.0, 0.0, 0.0],
+        "magnitude_n": 15000.0,
+        "disk_radius_m": 0.010
+      }
+    },
+    "nondesign_regions": [
+      {
+        "type": "cylinder_z",
+        "centers_m": [
+          [0.020, 0.020]
+        ],
+        "void_radius_m": 0.010,
+        "wall_radius_m": 0.016
+      },
+      {
+        "type": "cylinder_z",
+        "centers_m": [
+          [0.100, 0.020]
+        ],
+        "void_radius_m": 0.006,
+        "wall_radius_m": 0.010
+      }
+    ],
+    "boundary_conditions": {
+      "fixed_face": "x_min",
+      "load_face": "x_max",
+      "load_direction": [1.0, 0.0, 0.0],
+      "hole_inset_fraction": 0.0,
+      "shell_thickness_mm": 2.0
+    },
+    "export": {
+      "stl_output_dir": "outputs/meshes",
+      "stl_ascii": false
+    }
+  }

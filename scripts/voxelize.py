@@ -358,18 +358,51 @@ def _face_node_coords(face: str, nx: int, ny: int, nz: int, h: float):
             np.array(cb_list, dtype=np.float64))
 
 
+def _face_center_m(face: str, geom) -> tuple[float, float]:
+    """
+    Return the (ca, cb) centre of a named face in metres.
+
+    Matches the coordinate convention of _face_node_coords:
+      z_min / z_max  →  ca=x,  cb=y   →  centre = (length/2, width/2)
+      x_min / x_max  →  ca=y,  cb=z   →  centre = (width/2,  height/2)
+      y_min / y_max  →  ca=x,  cb=z   →  centre = (length/2, height/2)
+
+    Used by center_disk selectors so the disk is centred on the face
+    regardless of which face is specified — part_center_m() only returns
+    the XY centre and is wrong for x_min/x_max and y_min/y_max faces.
+    """
+    L = float(geom.length) / 1000.0
+    W = float(geom.width)  / 1000.0
+    H = float(geom.height) / 1000.0
+    if face in ("z_min", "z_max"):
+        return (L / 2.0, W / 2.0)
+    elif face in ("x_min", "x_max"):
+        return (W / 2.0, H / 2.0)
+    elif face in ("y_min", "y_max"):
+        return (L / 2.0, H / 2.0)
+    else:
+        raise ValueError(f"Unknown face: '{face}'")
+
+
 def _fixed_dofs_from_config(cfg, geom, nx, ny, nz, h):
     """Build fixed DOF array from FixedFaceConfig.
 
     Args:
         cfg:  FixedFaceConfig (face, selector, inset_m, disk_radius_m)
-        geom: GeometryParams  (needed by 'leg_holes' selector)
+        geom: GeometryParams  (needed by 'center_disk' and 'leg_holes' selectors)
         nx, ny, nz, h: grid dimensions and voxel size
+
+    Supported selectors:
+        full        — fix every node on the face (encastre)
+        corners     — four corner disks (inset_m + disk_radius_m from params)
+        center_disk — single disk centred on the face (disk_radius_m from params)
+        leg_holes   — N disks at polar positions (leg_hole_radius, num_legs, etc.)
     """
     nodes_arr, ca, cb = _face_node_coords(cfg.face, nx, ny, nz, h)
 
     if cfg.selector == "full":
         selected = nodes_arr
+
     elif cfg.selector == "corners":
         # Find the 4 corners of the face bounding box
         a_min, a_max = ca.min(), ca.max()
@@ -385,6 +418,20 @@ def _fixed_dofs_from_config(cfg, geom, nx, ny, nz, h):
             dist = np.sqrt((ca - corner_a)**2 + (cb - corner_b)**2)
             mask |= dist < cfg.disk_radius_m
         selected = nodes_arr[mask]
+
+    elif cfg.selector == "center_disk":
+        # Single disk centred on the face — used for pin-bore style BCs.
+        # Uses _face_center_m so the centre is correct for any face orientation.
+        cx_m, cy_m = _face_center_m(cfg.face, geom)
+        dist = np.sqrt((ca - cx_m)**2 + (cb - cy_m)**2)
+        mask = dist < cfg.disk_radius_m
+        assert mask.any(), (
+            f"center_disk fixed BC selected no nodes — "
+            f"disk_radius_m={cfg.disk_radius_m} may be too small relative to "
+            f"voxel size. face={cfg.face}, center=({cx_m:.4f},{cy_m:.4f})"
+        )
+        selected = nodes_arr[mask]
+
     elif cfg.selector == "leg_holes":
         # N disks at polar positions around the part centre.
         # Geometry fields: leg_hole_radius (mm), num_legs, first_leg_angle (deg)
@@ -404,8 +451,12 @@ def _fixed_dofs_from_config(cfg, geom, nx, ny, nz, h):
             dist = np.sqrt((ca - lx)**2 + (cb - ly)**2)
             mask |= dist < cfg.disk_radius_m
         selected = nodes_arr[mask]
+
     else:
-        raise ValueError(f"Unknown selector: '{cfg.selector}'")
+        raise ValueError(
+            f"Unknown fixed selector: '{cfg.selector}'. "
+            f"Valid options: full, corners, center_disk, leg_holes"
+        )
 
     return np.array(
         [3 * int(n) + d for n in selected for d in range(3)],
@@ -420,19 +471,31 @@ def _load_dofs_from_config(cfg, geom, nx, ny, nz, h):
         cfg:  LoadFaceConfig (face, selector, direction, magnitude_n, disk_radius_m)
         geom: GeometryParams (needed by 'center_disk' selector)
         nx, ny, nz, h: grid dimensions and voxel size
+
+    Supported selectors:
+        full        — distribute load over every node on the face
+        center_disk — concentrate load on a disk centred on the face
     """
     nodes_arr, ca, cb = _face_node_coords(cfg.face, nx, ny, nz, h)
 
     # Select which nodes receive load
     if cfg.selector == "full":
         selected = nodes_arr
+
     elif cfg.selector == "center_disk":
-        cx_m, cy_m = part_center_m(geom)
+        # Uses _face_center_m so the centre is correct for any face orientation.
+        # Previously used part_center_m() which returned the wrong centre for
+        # x_min/x_max and y_min/y_max faces.
+        cx_m, cy_m = _face_center_m(cfg.face, geom)
         dist = np.sqrt((ca - cx_m)**2 + (cb - cy_m)**2)
         mask = dist < cfg.disk_radius_m
         selected = nodes_arr[mask]
+
     else:
-        raise ValueError(f"Unknown load selector: '{cfg.selector}'")
+        raise ValueError(
+            f"Unknown load selector: '{cfg.selector}'. "
+            f"Valid options: full, center_disk"
+        )
 
     n_selected = len(selected)
     assert n_selected > 0, (
