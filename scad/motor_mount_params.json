@@ -1,93 +1,141 @@
 {
-    "_comment": "Motor mount bracket — wall-mounted plate at x_min, motor-mount face at x_max. Loaded downward (-z) on the motor-plate centre, fixed at 4 wall-plate corners. 4 wall holes + 4 NEMA-17 motor holes, all cylinder_x (drilled along X).",
-    "part_name": "motor_mount",
-    "geometry": {
-      "length": 70.0,
-      "width": 60.0,
-      "height": 80.0,
-      "wall_hole_diameter": 6.0,
-      "wall_hole_inset": 10.0,
-      "motor_hole_diameter": 4.0,
-      "motor_hole_pitch": 31.0,
-      "motor_center_y": 30.0,
-      "motor_center_z": 40.0
+  "_comment": "Motor mount bracket \u2014 wall-mounted plate at x_min, motor-mount face at x_max. Loaded downward (-z) on the motor-plate centre, fixed at 4 wall-plate corners. 4 wall holes + 4 NEMA-17 motor holes, all cylinder_x (drilled along X).",
+  "part_name": "motor_mount",
+  "geometry": {
+    "length": 70.0,
+    "width": 60.0,
+    "height": 80.0,
+    "wall_hole_diameter": 6.0,
+    "wall_hole_inset": 10.0,
+    "motor_hole_diameter": 4.0,
+    "motor_hole_pitch": 31.0,
+    "motor_center_y": 30.0,
+    "motor_center_z": 40.0
+  },
+  "mesh_hints": {
+    "target_element_size": 10.0,
+    "opt_domain_element_size_mm": 2.5,
+    "refinement_regions": []
+  },
+  "load_hints": {
+    "primary_face": "right",
+    "load_magnitude_n": 5000.0
+  },
+  "load_case": {
+    "fixed": {
+      "face": "x_min",
+      "selector": "corners",
+      "inset_m": 0.01,
+      "disk_radius_m": 0.005
     },
-    "mesh_hints": {
-      "target_element_size": 10.0,
-      "opt_domain_element_size_mm": 2.5,
-      "refinement_regions": []
-    },
-    "load_hints": {
-      "primary_face": "right",
-      "load_magnitude_n": 5000.00
-    },
-    "load_case": {
-      "fixed": {
-        "face": "x_min",
-        "selector": "corners",
-        "inset_m": 0.010,
-        "disk_radius_m": 0.005
-      },
-      "load": {
-        "face": "x_max",
-        "selector": "center_disk",
-        "direction": [0.0, 0.0, -1.0],
-        "magnitude_n": 5000.0,
-        "disk_radius_m": 0.020
-      }
-    },
-    "nondesign_regions": [],
-    "void_regions": [],
-    "bolt_seats": [
-      {
-        "_comment": "Wall-mount bolts — M5 clearance with 5mm collar, 5mm seated depth. Only the x_min entry side (the wall plate) gets a collar; the optimizer is free to treat the x_max exit side.",
-        "type": "bolt_seat_x",
-        "centers_m": [
-          [0.010, 0.010],
-          [0.050, 0.010],
-          [0.010, 0.070],
-          [0.050, 0.070]
-        ],
-        "void_radius_m": 0.003,
-        "wall_radius_m": 0.005,
-        "seat_depth_m":  0.005,
-        "entry_seat":    true,
-        "exit_seat":     false
-      },
-      {
-        "_comment": "NEMA-17 motor-mount bolts — M3 clearance with 3mm collar, 5mm seated depth. Only the x_max exit side (motor plate) needs a collar.",
-        "type": "bolt_seat_x",
-        "centers_m": [
-          [0.0145, 0.0245],
-          [0.0455, 0.0245],
-          [0.0145, 0.0555],
-          [0.0455, 0.0555]
-        ],
-        "void_radius_m": 0.002,
-        "wall_radius_m": 0.003,
-        "seat_depth_m":  0.005,
-        "entry_seat":    false,
-        "exit_seat":     true
-      }
-    ],
-    "boundary_conditions": {
-      "fixed_face": "left",
-      "load_face": "right",
-      "load_direction": [0.0, 0.0, -1.0],
-      "hole_inset_fraction": 0.15,
-      "shell_thickness_mm": 2.0
-    },
-    "export": {
-      "stl_output_dir": "outputs/meshes",
-      "stl_ascii": false
-    },
-    "simp": {
-      "voxel_size_mm": 1.0,
-      "volume_fraction": 0.45,
-      "filter_radius": 3.0,
-      "max_iterations": 200,
-      "convergence_tol": 0.0005,
-      "move_limit": 0.3,
-      "penal": 3.0
+    "load": {
+      "face": "x_max",
+      "selector": "center_disk",
+      "direction": [
+        0.0,
+        0.0,
+        -1.0
+      ],
+      "magnitude_n": 5000.0,
+      "disk_radius_m": 0.02
     }
+  },
+  "nondesign_regions": [],
+  "void_regions": [],
+  "bolt_seats": [
+    {
+      "_comment": "Wall-mount bolts \u2014 M5 clearance with 5mm collar, 5mm seated depth. Only the x_min entry side (the wall plate) gets a collar; the optimizer is free to treat the x_max exit side.",
+      "type": "bolt_seat_x",
+      "centers_m": [
+        [
+          0.01,
+          0.01
+        ],
+        [
+          0.05,
+          0.01
+        ],
+        [
+          0.01,
+          0.07
+        ],
+        [
+          0.05,
+          0.07
+        ]
+      ],
+      "void_radius_m": 0.003,
+      "wall_radius_m": 0.005,
+      "seat_depth_m": 0.005,
+      "entry_seat": true,
+      "exit_seat": false
+    },
+    {
+      "_comment": "NEMA-17 motor-mount bolts \u2014 M3 clearance with 3mm collar, 5mm seated depth. Only the x_max exit side (motor plate) needs a collar.",
+      "type": "bolt_seat_x",
+      "centers_m": [
+        [
+          0.0145,
+          0.0245
+        ],
+        [
+          0.0455,
+          0.0245
+        ],
+        [
+          0.0145,
+          0.0555
+        ],
+        [
+          0.0455,
+          0.0555
+        ]
+      ],
+      "void_radius_m": 0.002,
+      "wall_radius_m": 0.003,
+      "seat_depth_m": 0.005,
+      "entry_seat": false,
+      "exit_seat": true
+    }
+  ],
+  "boundary_conditions": {
+    "fixed_face": "left",
+    "load_face": "right",
+    "load_direction": [
+      0.0,
+      0.0,
+      -1.0
+    ],
+    "hole_inset_fraction": 0.15,
+    "shell_thickness_mm": 2.0
+  },
+  "export": {
+    "stl_output_dir": "outputs/meshes",
+    "stl_ascii": false
+  },
+  "simp": {
+    "voxel_size_mm": 1.0,
+    "volume_fraction": 0.45,
+    "filter_radius": 3.0,
+    "max_iterations": 200,
+    "convergence_tol": 0.0005,
+    "move_limit": 0.3,
+    "penal": 3.0
+  },
+  "load_cases": [
+    {
+      "force_vector": [
+        0.0,
+        0.0,
+        -5000.0
+      ],
+      "fixed_face": "x_min",
+      "load_face": "x_max"
+    }
+  ],
+  "material": {
+    "E": 210000000000.0,
+    "nu": 0.3,
+    "sigma_yield": 250000000.0
   }
+}
