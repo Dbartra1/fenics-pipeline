@@ -165,6 +165,10 @@ impl LoadCase {
 
 /// Solver configuration — all SIMP algorithm parameters.
 ///
+/// `use_gpu`               — attempt GPU-accelerated solve (cuSPARSE ILU(0)-PCG).
+///                           Requires the `gpu` feature flag at compile time.
+///                           Set to `false` to force CPU path even on GPU builds.
+///                           Silently ignored when compiled without `--features gpu`.
 /// `volume_fraction`       — target fraction of solid material (0 < vf < 1).
 /// `penal`                 — penalization exponent p (typically 3.0).
 /// `filter_radius`         — sensitivity filter radius in metres.
@@ -189,17 +193,25 @@ impl LoadCase {
 /// `checkpoint_every`      — write density.bin every N iterations (0 = off).
 #[derive(Debug, Clone)]
 pub struct SimpConfig {
-    pub volume_fraction: f64,
-    pub penal: f64,
-    pub filter_radius: f64,
-    pub max_iterations: usize,
-    pub min_iterations: usize,
-    pub convergence_tol: f64,
+    pub use_gpu:           bool,
+    pub volume_fraction:   f64,
+    pub penal:             f64,
+    pub filter_radius:     f64,
+    pub max_iterations:    usize,
+    pub min_iterations:    usize,
+    pub convergence_tol:   f64,
     pub compliance_spread_tol: Option<f64>,
-    pub density_change_tol: Option<f64>,
-    pub move_limit: f64,
-    pub damping: f64,
-    pub checkpoint_every: usize,
+    pub density_change_tol:    Option<f64>,
+    pub move_limit:        f64,
+    pub damping:           f64,
+    pub checkpoint_every:  usize,
+    /// Maximum CG iterations per linear solve.
+    /// Caps runaway iteration counts on hard problems (high stiffness contrast
+    /// in early SIMP iterations).  SIMP is robust to inexact solves — a capped
+    /// result with residual ~1e-4 still produces correct topology.
+    /// Default: 800.  Set higher for very tight tolerances, lower to trade
+    /// accuracy for speed on large problems.
+    pub max_cg_iter:       usize,
 }
 
 impl SimpConfig {
@@ -557,6 +569,7 @@ mod tests {
 
     fn default_config() -> SimpConfig {
         SimpConfig {
+            use_gpu:               false,
             volume_fraction: 0.45,
             penal: 3.0,
             filter_radius: 0.008,
@@ -568,6 +581,7 @@ mod tests {
             move_limit: 0.05,
             damping: 0.5,
             checkpoint_every: 10,
+            max_cg_iter: 2000,
         }
     }
 

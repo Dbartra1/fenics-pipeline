@@ -1,6 +1,11 @@
 {
-  "_comment": "Motor mount bracket \u2014 wall-mounted plate at x_min, motor-mount face at x_max. Loaded downward (-z) on the motor-plate centre, fixed at 4 wall-plate corners. 4 wall holes + 4 NEMA-17 motor holes, all cylinder_x (drilled along X).",
+  "_comment": "Motor mount bracket — wall-mounted plate at x_min, motor-mount face at x_max.",
+  "_architecture": "Phase 5 two-region domain. Attachment slab bc=none. Fixity at 4 wall bolt patches via load_case.fixed corners selector. Load distributed across full x_max face, gravity direction.",
+  "_load_case_note": "Single load case: gravity only (-Z) on full x_max face. NEMA bolt pattern selector and multi-load case come next session.",
+  "_bc_note": "bc=none keeps slab forced-solid but does NOT fix entire x_min face. Only 4 corner disk patches at wall bolt positions are fixed. Correct physical setup.",
+
   "part_name": "motor_mount",
+
   "geometry": {
     "length": 70.0,
     "width": 60.0,
@@ -12,127 +17,105 @@
     "motor_center_y": 30.0,
     "motor_center_z": 40.0
   },
+
   "mesh_hints": {
     "target_element_size": 10.0,
     "opt_domain_element_size_mm": 2.5,
     "refinement_regions": []
   },
+
   "load_hints": {
     "primary_face": "right",
     "load_magnitude_n": 5000.0
   },
+
   "load_case": {
+    "_comment": "Fixed: 4 corner disk patches at wall bolt positions on x_min. Inside forced-solid slab so always in solid material. disk_radius_m=0.006 > bolt void radius 0.004. Load: full x_max, gravity -Z, 5000N.",
     "fixed": {
       "face": "x_min",
       "selector": "corners",
-      "inset_m": 0.01,
-      "disk_radius_m": 0.005
+      "inset_m": 0.010,
+      "disk_radius_m": 0.006
     },
     "load": {
       "face": "x_max",
-      "selector": "center_disk",
-      "direction": [
-        0.0,
-        0.0,
-        -1.0
-      ],
+      "selector": "full",
+      "direction": [0.0, 0.0, -1.0],
       "magnitude_n": 5000.0,
-      "disk_radius_m": 0.02
+      "disk_radius_m": 0.020
     }
   },
+
+  "attachment_regions": [
+    {
+      "_comment": "6mm wall plate at x_min. Forced solid, bc=none. Fixity owned by load_case.fixed corner disks. Bolt voids punched post-marking.",
+      "type": "slab_x",
+      "a_min": 0.0,
+      "a_max": 0.006,
+      "bc": "none",
+      "bolt_voids": [
+        {"center_a_m": 0.010, "center_b_m": 0.010, "radius_m": 0.004},
+        {"center_a_m": 0.050, "center_b_m": 0.010, "radius_m": 0.004},
+        {"center_a_m": 0.010, "center_b_m": 0.070, "radius_m": 0.004},
+        {"center_a_m": 0.050, "center_b_m": 0.070, "radius_m": 0.004}
+      ]
+    }
+  ],
+
   "nondesign_regions": [],
+
   "void_regions": [],
+
   "bolt_seats": [
     {
-      "_comment": "Wall-mount bolts \u2014 M5 clearance with 5mm collar, 5mm seated depth. Only the x_min entry side (the wall plate) gets a collar; the optimizer is free to treat the x_max exit side.",
+      "_comment": "NEMA-17 motor bolts — exit collar at x_max only. void_radius_m=0.004 > filter_radius=0.003.",
       "type": "bolt_seat_x",
       "centers_m": [
-        [
-          0.01,
-          0.01
-        ],
-        [
-          0.05,
-          0.01
-        ],
-        [
-          0.01,
-          0.07
-        ],
-        [
-          0.05,
-          0.07
-        ]
+        [0.0145, 0.0245],
+        [0.0455, 0.0245],
+        [0.0145, 0.0555],
+        [0.0455, 0.0555]
       ],
-      "void_radius_m": 0.003,
-      "wall_radius_m": 0.005,
-      "seat_depth_m": 0.005,
-      "entry_seat": true,
-      "exit_seat": false
-    },
-    {
-      "_comment": "NEMA-17 motor-mount bolts \u2014 M3 clearance with 3mm collar, 5mm seated depth. Only the x_max exit side (motor plate) needs a collar.",
-      "type": "bolt_seat_x",
-      "centers_m": [
-        [
-          0.0145,
-          0.0245
-        ],
-        [
-          0.0455,
-          0.0245
-        ],
-        [
-          0.0145,
-          0.0555
-        ],
-        [
-          0.0455,
-          0.0555
-        ]
-      ],
-      "void_radius_m": 0.002,
-      "wall_radius_m": 0.003,
-      "seat_depth_m": 0.005,
+      "void_radius_m": 0.004,
+      "wall_radius_m": 0.007,
+      "seat_depth_m": 0.008,
       "entry_seat": false,
       "exit_seat": true
     }
   ],
+
   "boundary_conditions": {
+    "_comment": "Legacy FEniCSx path only.",
     "fixed_face": "left",
     "load_face": "right",
-    "load_direction": [
-      0.0,
-      0.0,
-      -1.0
-    ],
+    "load_direction": [0.0, 0.0, -1.0],
     "hole_inset_fraction": 0.15,
     "shell_thickness_mm": 2.0
   },
+
   "export": {
     "stl_output_dir": "outputs/meshes",
     "stl_ascii": false
   },
+
   "simp": {
     "voxel_size_mm": 1.0,
-    "volume_fraction": 0.45,
+    "volume_fraction": 0.35,
     "filter_radius": 3.0,
     "max_iterations": 200,
     "convergence_tol": 0.0005,
     "move_limit": 0.3,
     "penal": 3.0
   },
+
   "load_cases": [
     {
-      "force_vector": [
-        0.0,
-        0.0,
-        -5000.0
-      ],
+      "force_vector": [0.0, 0.0, -5000.0],
       "fixed_face": "x_min",
       "load_face": "x_max"
     }
   ],
+
   "material": {
     "E": 210000000000.0,
     "nu": 0.3,

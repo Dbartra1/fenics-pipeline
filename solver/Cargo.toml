@@ -14,8 +14,20 @@ faer       = "0.19"
 rayon      = "1.10"
 cudarc     = { version = "0.19", features = ["cuda-12060", "cusparse", "cublas", "driver", "fallback-dynamic-loading"], optional = true }
 
+# cc is always a build-dep so build.rs compiles unconditionally.
+# The amgcl code-path inside build.rs is gated by CARGO_FEATURE_AMGCL.
+[build-dependencies]
+cc = "1.0"
+
 [features]
-gpu = ["cudarc"]
+# amgcl: algebraic multigrid via AMGCL C++ library (MIT, header-only).
+#   CPU OpenMP path is default.  Phase B will add amgcl/backend/cuda.hpp
+#   for GPU acceleration without touching any other file.
+#   Requires: scripts/setup_amgcl.sh (downloads headers once into vendor/).
+#   Build env: g++ with C++14 and OpenMP (build-essential in WSL2 Ubuntu).
+default = ["amgcl"]
+amgcl   = []
+gpu     = ["cudarc"]
 
 [profile.release]
 opt-level = 3

@@ -9,6 +9,10 @@
 # Phase 2: load_case_config drives face selection in voxelize.py,
 #           nondesign_regions drives void/nondesign mask generation.
 #           Both fall back to legacy behavior if absent.
+# Phase 5: attachment_regions — forced-solid slabs that own both the
+#           nondesign voxels AND the boundary condition for the solver.
+#           LoadCaseConfig.fixed is now Optional; when None, the BC is
+#           derived entirely from attachment_regions.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
@@ -126,7 +130,7 @@ class FixedFaceConfig:
     disk_radius_m:  float = 0.005
 
     VALID_FACES     = {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}
-    VALID_SELECTORS = {"full", "corners", "leg_holes"}
+    VALID_SELECTORS = {"full", "corners", "leg_holes", "center_disk"}
 
     def validate(self) -> None:
         assert self.face in self.VALID_FACES, \
@@ -135,6 +139,7 @@ class FixedFaceConfig:
             f"selector must be one of {self.VALID_SELECTORS}, got '{self.selector}'"
         assert self.inset_m > 0, "inset_m must be > 0"
         assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
+
 
 @dataclass
 class LoadFaceConfig:
@@ -178,20 +183,28 @@ class LoadFaceConfig:
         assert self.magnitude_n > 0, "magnitude_n must be > 0"
         assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
 
+
 @dataclass
 class LoadCaseConfig:
     """
     Full load case: fixed BCs + applied load.
     Replaces the hardcoded logic in build_load_case().
+
+    Phase 5 note: fixed is now Optional.  When None, the fixed BCs are
+    derived entirely from attachment_regions in voxelize.build_load_case().
+    Omit the "fixed" key from the load_case JSON block to trigger this path
+    (the motor mount uses it — the attachment slab owns fixity).
     """
-    fixed: FixedFaceConfig = field(default_factory=FixedFaceConfig)
-    load:  LoadFaceConfig  = field(default_factory=LoadFaceConfig)
+    fixed: Optional[FixedFaceConfig] = None
+    load:  LoadFaceConfig            = field(default_factory=LoadFaceConfig)
 
     def validate(self) -> None:
-        self.fixed.validate()
+        if self.fixed is not None:
+            self.fixed.validate()
         self.load.validate()
-        assert self.fixed.face != self.load.face, \
-            "fixed face and load face cannot be the same"
+        if self.fixed is not None:
+            assert self.fixed.face != self.load.face, \
+                "fixed face and load face cannot be the same"
 
 
 @dataclass
@@ -223,6 +236,7 @@ class NondesignRegion:
         assert len(self.centers_m) > 0, "centers_m must not be empty"
         for c in self.centers_m:
             assert len(c) == 2, "each center must be [a, b]"
+
 
 @dataclass
 class VoidRegion:
@@ -351,6 +365,117 @@ class BoltSeatRegion:
 
 
 @dataclass
+class AttachmentBoltVoid:
+    """
+    A cylindrical void punched through an attachment slab AFTER the slab
+    is marked nondesign.  This is the key operation that eliminates
+    BC-void singularities: the void is created in a region that is
+    structurally independent of the BC assignment.
+
+    Coordinate convention matches the slab axis:
+      slab_x  →  center_a_m = Y coord,  center_b_m = Z coord
+      slab_y  →  center_a_m = X coord,  center_b_m = Z coord
+      slab_z  →  center_a_m = X coord,  center_b_m = Y coord
+
+    All values in metres.
+    """
+    center_a_m: float
+    center_b_m: float
+    radius_m:   float
+
+    def validate(self) -> None:
+        assert self.radius_m > 0, \
+            f"AttachmentBoltVoid radius_m must be > 0, got {self.radius_m}"
+
+
+@dataclass
+class AttachmentRegion:
+    """
+    A forced-solid slab that owns both nondesign voxels AND boundary
+    conditions.  This is the two-region domain architecture entry point.
+
+    The voxelizer processes attachment regions in two steps:
+      1. Mark all voxels within [a_min, a_max] as nondesign = 1.
+      2. Punch each bolt_void through the slab as void = 1, nondesign = 0.
+    BC derivation (fixed DOFs) happens in build_load_case, not here.
+
+    type:        "slab_x" | "slab_y" | "slab_z"
+                   slab_x → slab bounded in X,   full Y/Z extent
+                   slab_y → slab bounded in Y,   full X/Z extent
+                   slab_z → slab bounded in Z,   full X/Y extent
+
+    a_min:       Low bound of slab along the normal axis (metres).
+    a_max:       High bound of slab along the normal axis (metres).
+                 For a 6mm wall-mount slab at x=0: a_min=0.0, a_max=0.006.
+
+    bc:          "fixed_full"  — fix every node on the outboard face
+                                 (a_min face for wall-mount; a_max for
+                                 a load-side pad — set bc_face to override).
+                 "none"        — forced solid but no BC (load-bearing pad
+                                 that attaches to a load region, not fixed).
+
+    bc_face:     Which face of the slab carries the BC.  The sentinel
+                 "a_min_face" auto-resolves to "x_min"/"y_min"/"z_min"
+                 based on slab type — the correct default for a wall-mount
+                 slab at the origin.  Set explicitly (e.g. "x_max") for
+                 cases where the fixed face is the far side of the slab.
+
+    bolt_voids:  Cylindrical voids punched through the slab post-marking.
+                 No BC-void singularity is possible by construction because
+                 the slab nondesign marking and void punching are sequential,
+                 and the final priority rule (void > nondesign) applies.
+
+    Example — motor mount wall plate (6mm slab, 4 bolt clearance holes):
+
+        {
+          "type": "slab_x",
+          "a_min": 0.0,
+          "a_max": 0.006,
+          "bc": "fixed_full",
+          "bolt_voids": [
+            { "center_a_m": 0.010, "center_b_m": 0.010, "radius_m": 0.003 },
+            { "center_a_m": 0.050, "center_b_m": 0.010, "radius_m": 0.003 },
+            { "center_a_m": 0.010, "center_b_m": 0.070, "radius_m": 0.003 },
+            { "center_a_m": 0.050, "center_b_m": 0.070, "radius_m": 0.003 }
+          ]
+        }
+    """
+    type:        str
+    a_min:       float
+    a_max:       float
+    bc:          str  = "fixed_full"
+    bc_face:     str  = "a_min_face"   # sentinel; resolved at voxelize time
+    bolt_voids:  List = field(default_factory=list)
+
+    VALID_TYPES    = {"slab_x", "slab_y", "slab_z"}
+    VALID_BC_TYPES = {"fixed_full", "none"}
+
+    def validate(self) -> None:
+        assert self.type in self.VALID_TYPES, \
+            f"AttachmentRegion type must be one of {self.VALID_TYPES}, got '{self.type}'"
+        assert self.a_max > self.a_min, \
+            (f"AttachmentRegion a_max ({self.a_max}) must be > "
+             f"a_min ({self.a_min})")
+        assert self.bc in self.VALID_BC_TYPES, \
+            f"AttachmentRegion bc must be one of {self.VALID_BC_TYPES}, got '{self.bc}'"
+        for v in self.bolt_voids:
+            v.validate()
+
+    def resolved_bc_face(self) -> str:
+        """
+        Return the concrete face name for this region's BC, resolving
+        the "a_min_face" sentinel to the appropriate face string.
+        """
+        if self.bc_face != "a_min_face":
+            return self.bc_face
+        return {
+            "slab_x": "x_min",
+            "slab_y": "y_min",
+            "slab_z": "z_min",
+        }[self.type]
+
+
+@dataclass
 class LoadHints:
     """Kept for backward compatibility with Stage 03 FEniCSx path."""
     primary_face:     str
@@ -378,19 +503,23 @@ class PipelineParams:
     load_hints:           LoadHints
     export:               ExportParams
     boundary_conditions:  BoundaryConditions    = field(default_factory=BoundaryConditions)
-    
+
     # Phase 2: declarative load case and nondesign regions (optional)
     load_case_config:     Optional[LoadCaseConfig]      = None
     nondesign_regions:    List[NondesignRegion]          = field(default_factory=list)
-    
-    # Phase 3: axis-aligned box regions forced void (empty space in non-rectangular parts)
+
     # Phase 3: axis-aligned box regions forced void (empty space in non-rectangular parts)
     void_regions:         List[VoidRegion]               = field(default_factory=list)
 
     # Phase 4: bolt seats (through-hole + collar only at entry/exit faces).
     # Preferred over full-length cylinder_* NondesignRegion for bracket-
     # style parts where a thick sleeve would burn the material budget.
-    bolt_seats:           List[BoltSeatRegion]            = field(default_factory=list)
+    bolt_seats:           List[BoltSeatRegion]           = field(default_factory=list)
+
+    # Phase 5: attachment regions — forced-solid slabs that own both the
+    # nondesign voxels and the fixed BC.  When present, LoadCaseConfig.fixed
+    # may be omitted; fixity is derived from the slab face instead.
+    attachment_regions:   List[AttachmentRegion]         = field(default_factory=list)
 
     def validate(self) -> None:
         """Run all sub-validators."""
@@ -406,6 +535,23 @@ class PipelineParams:
             r.validate()
         for r in self.bolt_seats:
             r.validate()
+        for r in self.attachment_regions:
+            r.validate()
+        # Guard: if no attachment_regions provide fixity, load_case_config.fixed
+        # must be present so the solver always receives a non-empty fixed_dofs array.
+        has_attachment_bc = any(
+            r.bc != "none" for r in self.attachment_regions
+        )
+        lc_has_fixed = (
+            self.load_case_config is not None
+            and self.load_case_config.fixed is not None
+        )
+        if self.load_case_config is not None and not has_attachment_bc and not lc_has_fixed:
+            raise AssertionError(
+                "load_case_config has no fixed spec and no attachment_regions "
+                "provide bc != 'none'. The solver will receive an empty "
+                "fixed_dofs array and the stiffness matrix will be singular."
+            )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "PipelineParams":
@@ -422,18 +568,21 @@ class PipelineParams:
     def _from_raw(cls, raw: dict) -> "PipelineParams":
         """
         Deserialize with backward compatibility.
-        New fields (load_case_config, nondesign_regions) are optional.
+        New fields (load_case_config, nondesign_regions, attachment_regions)
+        are all optional.
         """
-        bc_raw = raw.get("boundary_conditions", {})
+        bc_raw = {k: v for k, v in raw.get("boundary_conditions", {}).items()
+                  if not k.startswith("_")}
 
-        # Parse load_case_config if present
+        # Parse load_case_config if present.
+        # fixed is Optional — absent key means "derive fixity from attachment_regions".
         lc_raw = raw.get("load_case", None)
         load_case_config = None
         if lc_raw is not None:
-            fixed_raw = lc_raw.get("fixed", {})
+            fixed_raw = lc_raw.get("fixed", None)
             load_raw  = lc_raw.get("load", {})
             load_case_config = LoadCaseConfig(
-                fixed=FixedFaceConfig(**fixed_raw) if fixed_raw else FixedFaceConfig(),
+                fixed=FixedFaceConfig(**fixed_raw) if fixed_raw else None,
                 load=LoadFaceConfig(**load_raw)    if load_raw  else LoadFaceConfig(),
             )
 
@@ -444,7 +593,6 @@ class PipelineParams:
             for r in nd_raw
         ]
 
-        # Parse void_regions if present (Phase 3)
         # Parse void_regions if present (Phase 3)
         vr_raw = raw.get("void_regions", [])
         void_regions = [
@@ -459,6 +607,25 @@ class PipelineParams:
             for r in bs_raw
         ]
 
+        # Parse attachment_regions if present (Phase 5)
+        ar_raw = raw.get("attachment_regions", [])
+        attachment_regions = []
+        for r in ar_raw:
+            bolt_voids_raw = r.get("bolt_voids", [])
+            bolt_voids = [
+                AttachmentBoltVoid(
+                    **{k: v for k, v in bv.items() if not k.startswith("_")}
+                )
+                for bv in bolt_voids_raw
+            ]
+            region_data = {
+                k: v for k, v in r.items()
+                if not k.startswith("_") and k != "bolt_voids"
+            }
+            attachment_regions.append(
+                AttachmentRegion(**region_data, bolt_voids=bolt_voids)
+            )
+
         return cls(
             part_name=raw["part_name"],
             geometry=GeometryParams(**raw["geometry"]),
@@ -471,6 +638,7 @@ class PipelineParams:
             nondesign_regions=nondesign_regions,
             void_regions=void_regions,
             bolt_seats=bolt_seats,
+            attachment_regions=attachment_regions,
         )
 
     def to_openscad_defines(self) -> dict:

@@ -4,12 +4,16 @@
 //
 // Python writes problem.json + binary files → Rust reads → solves → writes outputs.
 // All binary files are little-endian, no header, flat arrays.
+//
+// Checkpoint format (written every cfg.checkpoint_every iters):
+//   {out_dir}/checkpoint.bin       — f32 density, same format as density.bin
+//   {out_dir}/checkpoint_meta.json — iter_completed, compliance/volume histories
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::types::{Grid, LoadCase, Material, Problem, SimpConfig};
 
@@ -38,9 +42,13 @@ struct MaterialJson {
 }
 
 fn default_min_iterations() -> usize { 10 }
+fn default_use_gpu()        -> bool  { true }
+fn default_max_cg_iter()    -> usize { 2000 }
 
 #[derive(Deserialize)]
 struct ConfigJson {
+    #[serde(default = "default_use_gpu")]
+    use_gpu:               bool,
     volume_fraction:       f64,
     penal:                 f64,
     filter_radius:         f64,
@@ -55,6 +63,8 @@ struct ConfigJson {
     move_limit:            f64,
     damping:               f64,
     checkpoint_every:      usize,
+    #[serde(default = "default_max_cg_iter")]
+    max_cg_iter:           usize,
 }
 
 #[derive(Deserialize)]
@@ -117,6 +127,23 @@ fn read_u8(path: &Path) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+// ─── Checkpoint types ─────────────────────────────────────────────────────────
+
+/// Metadata written alongside checkpoint.bin.
+/// Sufficient to fully resume a SIMP run: density comes from checkpoint.bin,
+/// histories and iter count come from here.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct CheckpointMeta {
+    /// Number of SIMP iterations fully completed (not including in-flight).
+    pub iter_completed:     usize,
+    /// Compliance history up to and including iter_completed.
+    pub compliance_history: Vec<f64>,
+    /// Volume fraction history up to and including iter_completed.
+    pub volume_history:     Vec<f64>,
+    /// Element count — used to validate checkpoint matches current problem.
+    pub n_elem:             usize,
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Load a Problem from a problem.json file.
@@ -136,7 +163,6 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
     };
     let n_elem = grid.n_elem();
 
-    // Load case
     let fixed_dofs_u32 = read_u32_le(&p(&pj.load_case.fixed_dofs_file))?;
     let load_dofs_u32  = read_u32_le(&p(&pj.load_case.load_dofs_file))?;
     let load_vals      = read_f64_le(&p(&pj.load_case.load_vals_file))?;
@@ -148,7 +174,6 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
     };
     load_case.validate()?;
 
-    // Masks
     let nondesign_u8 = read_u8(&p(&pj.nondesign_file))?;
     let void_u8      = read_u8(&p(&pj.void_file))?;
 
@@ -162,7 +187,6 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
     let nondesign: Vec<bool> = nondesign_u8.iter().map(|&b| b != 0).collect();
     let void_mask: Vec<bool> = void_u8.iter().map(|&b| b != 0).collect();
 
-    // Optional warm start
     let x_init = if let Some(ref fname) = pj.x_init_file {
         let vals_f32 = read_f32_le(&p(fname))?;
         if vals_f32.len() != n_elem {
@@ -178,6 +202,7 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
         material: Material { young: pj.material.young, poisson: pj.material.poisson },
         load_case,
         config: SimpConfig {
+            use_gpu:               pj.config.use_gpu,
             volume_fraction:       pj.config.volume_fraction,
             penal:                 pj.config.penal,
             filter_radius:         pj.config.filter_radius,
@@ -189,6 +214,7 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
             move_limit:            pj.config.move_limit,
             damping:               pj.config.damping,
             checkpoint_every:      pj.config.checkpoint_every,
+            max_cg_iter:           pj.config.max_cg_iter,
         },
         nondesign,
         void_mask,
@@ -217,6 +243,68 @@ pub fn write_result(path: &Path, result: &SolveResult) -> Result<(), String> {
     fs::write(path, json)
         .map_err(|e| format!("Cannot write {:?}: {e}", path))?;
     Ok(())
+}
+
+/// Write a mid-run checkpoint.
+/// Two files are written atomically (meta last, so a partial write of the
+/// binary doesn't leave a valid meta pointing to stale data):
+///   {out_dir}/checkpoint.bin       — f32 density
+///   {out_dir}/checkpoint_meta.json — CheckpointMeta
+pub fn write_checkpoint(out_dir: &Path, density: &[f64], meta: &CheckpointMeta)
+    -> Result<(), String>
+{
+    // Write density first (largest, most likely to be interrupted)
+    write_density(&out_dir.join("checkpoint.bin"), density)?;
+    // Write meta last — its presence is the "checkpoint is valid" signal
+    let json = serde_json::to_string_pretty(meta)
+        .map_err(|e| format!("Checkpoint meta serialise error: {e}"))?;
+    fs::write(out_dir.join("checkpoint_meta.json"), json)
+        .map_err(|e| format!("Cannot write checkpoint_meta.json: {e}"))?;
+    Ok(())
+}
+
+/// Try to read a valid checkpoint from {out_dir}.
+/// Returns None if checkpoint files are absent, mismatched, or corrupt —
+/// in all such cases the caller should start from scratch.
+pub fn read_checkpoint(out_dir: &Path, n_elem: usize)
+    -> Option<(Vec<f64>, CheckpointMeta)>
+{
+    let bin_path  = out_dir.join("checkpoint.bin");
+    let meta_path = out_dir.join("checkpoint_meta.json");
+
+    if !bin_path.exists() || !meta_path.exists() {
+        return None;
+    }
+
+    let meta_str = fs::read_to_string(&meta_path).ok()?;
+    let meta: CheckpointMeta = serde_json::from_str(&meta_str).ok()?;
+
+    // Validate element count — catches stale checkpoints from different runs
+    if meta.n_elem != n_elem {
+        eprintln!(
+            "[checkpoint] stale checkpoint (n_elem={} vs expected {}) — ignored",
+            meta.n_elem, n_elem
+        );
+        return None;
+    }
+
+    let vals_f32 = read_f32_le(&bin_path).ok()?;
+    if vals_f32.len() != n_elem {
+        eprintln!("[checkpoint] checkpoint.bin has {} elements, expected {} — ignored",
+                  vals_f32.len(), n_elem);
+        return None;
+    }
+
+    let density: Vec<f64> = vals_f32.iter().map(|&v| v as f64).collect();
+    Some((density, meta))
+}
+
+/// Delete checkpoint files after a clean run completion.
+/// Errors are silently ignored — stale checkpoints are harmless on next run
+/// (they'll be rejected by the n_elem validation).
+pub fn delete_checkpoint(out_dir: &Path) {
+    let _ = fs::remove_file(out_dir.join("checkpoint.bin"));
+    let _ = fs::remove_file(out_dir.join("checkpoint_meta.json"));
 }
 
 /// The result written to result.json.

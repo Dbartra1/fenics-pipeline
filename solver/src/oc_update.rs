@@ -142,6 +142,8 @@ mod tests {
             move_limit: 0.2,
             damping: 0.5,
             checkpoint_every: 10,
+            use_gpu:          false,
+            max_cg_iter:      2000,
         }
     }
 

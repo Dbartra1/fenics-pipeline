@@ -37,6 +37,13 @@ services:
       PYVISTA_OFF_SCREEN: "true"
       PYTHONFAULTHANDLER: "1"   # surfaced segfaults in 03_fea_fenicsx.ipynb
 
+    # GPU passthrough — works on both docker-compose V1 (runtime:) and
+    # V2/Swarm (deploy.resources.reservations.devices).
+    # V1 reads `runtime`, ignores `deploy`.
+    # V2 reads `deploy`, ignores `runtime` at the service level.
+    # Having both is safe and covers all versions.
+    runtime: nvidia
+
     deploy:
       resources:
         limits:

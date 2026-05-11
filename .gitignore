@@ -1,37 +1,40 @@
-# Pipeline outputs
+# ── Pipeline outputs ──────────────────────────────────────────────────────────
 outputs/
 
-# Mesh artifacts
+# ── Mesh artifacts ────────────────────────────────────────────────────────────
 *.msh
 *.xdmf
 *.h5
 *.stl
 
-# Python
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
 *.egg-info/
 
-# Jupyter
+# ── Jupyter ───────────────────────────────────────────────────────────────────
 .ipynb_checkpoints/
 
-# Environment
+# ── Environment ───────────────────────────────────────────────────────────────
 .env
 
-# Test case outputs
+# ── Test case outputs ─────────────────────────────────────────────────────────
 test_cases/*/outputs/
 test_cases/_previews/
 
+# ── Rust / solver ─────────────────────────────────────────────────────────────
 solver/target/
 bin/simp_solver
 
-# Logs
+# ── Vendored third-party headers (fetched by scripts/setup_amgcl.sh) ─────────
+# Do not commit — regenerate with: bash scripts/setup_amgcl.sh
+solver/vendor/amgcl/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
 outputs/logs/
 
-# macOS
+# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
-
-# Windows
 Thumbs.db

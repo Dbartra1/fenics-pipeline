@@ -7,12 +7,17 @@
 #           falls back to legacy geometry_params-based hole logic if absent.
 #           build_load_case() reads load_case_config from params if present,
 #           falls back to legacy top-load / corner-fix behavior if absent.
+# Phase 5: attachment_regions — forced-solid slabs with integrated BCs.
+#           voxelize_domain() marks the slab nondesign then punches bolt voids.
+#           build_load_case() derives fixed DOFs from the slab face.
+#           LoadCaseConfig.fixed may be None when attachment_regions own fixity.
 
 import math
 
 import numpy as np
 from src.geometry.param_schema import (
-    GeometryParams, LoadCaseConfig, NondesignRegion, VoidRegion, BoltSeatRegion
+    GeometryParams, LoadCaseConfig, NondesignRegion, VoidRegion,
+    BoltSeatRegion, AttachmentRegion, AttachmentBoltVoid,
 )
 from src.geometry.region_factory import part_center_m
 
@@ -40,9 +45,10 @@ def _node_idx(ix, iy, iz, nx, ny):
 def voxelize_domain(
     geometry_params: GeometryParams,
     grid_config: dict,
-    nondesign_regions=None,   # list[NondesignRegion] or None  (Phase 2)
-    void_regions=None,        # list[VoidRegion] or None       (Phase 3)
-    bolt_seats=None,          # list[BoltSeatRegion] or None   (Phase 4)
+    nondesign_regions=None,    # list[NondesignRegion] or None  (Phase 2)
+    void_regions=None,         # list[VoidRegion] or None       (Phase 3)
+    bolt_seats=None,           # list[BoltSeatRegion] or None   (Phase 4)
+    attachment_regions=None,   # list[AttachmentRegion] or None (Phase 5)
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns (nondesign, void_mask), each shape (nz, ny, nx), dtype uint8.
@@ -53,6 +59,8 @@ def voxelize_domain(
     unconditionally — used to mask the empty space in non-rectangular parts.
     If bolt_seats is provided (Phase 4), each bolt passes through as a
     full-axis void with forced-solid collars only near entry/exit faces.
+    If attachment_regions is provided (Phase 5), each slab is marked nondesign
+    first, then bolt_voids are punched through.  Priority: void > nondesign.
     """
     nx = grid_config["nx"]
     ny = grid_config["ny"]
@@ -190,7 +198,39 @@ def voxelize_domain(
                     )
                     nondesign[collar_mask] = 1
 
-    # void always takes priority over nondesign (catches any remaining overlap)
+    # ── Phase 5: attachment regions ───────────────────────────────────────
+    # Slab marked nondesign first, bolt voids punched through after.
+    # The sequential two-step is what eliminates BC-void singularities:
+    # the nondesign and void assignments never compete for the same voxels
+    # because void punching is a post-processing step on an already-marked slab.
+    if attachment_regions:
+        for region in attachment_regions:
+            if region.type == "slab_x":
+                slab_mask = (X >= region.a_min) & (X <= region.a_max)
+                perp_a, perp_b = Y, Z
+            elif region.type == "slab_y":
+                slab_mask = (Y >= region.a_min) & (Y <= region.a_max)
+                perp_a, perp_b = X, Z
+            elif region.type == "slab_z":
+                slab_mask = (Z >= region.a_min) & (Z <= region.a_max)
+                perp_a, perp_b = X, Y
+            else:
+                raise ValueError(
+                    f"Unknown AttachmentRegion type: {region.type}"
+                )
+
+            # Step 1: mark entire slab nondesign
+            nondesign[slab_mask] = 1
+
+            # Step 2: punch bolt voids through the slab
+            for bv in region.bolt_voids:
+                r2 = (perp_a - bv.center_a_m)**2 + (perp_b - bv.center_b_m)**2
+                bolt_mask = slab_mask & (r2 < bv.radius_m**2)
+                void_mask[bolt_mask]  = 1
+                nondesign[bolt_mask]  = 0   # void overrides nondesign inline
+
+    # ── Final priority: void always wins over nondesign ───────────────────
+    # Catches any residual overlap from region ordering across all phases.
     nondesign[void_mask == 1] = 0
 
     return nondesign, void_mask
@@ -202,13 +242,20 @@ def build_load_case(
     geometry_params: GeometryParams,
     load_hints,
     grid_config: dict,
-    load_case_config=None,    # LoadCaseConfig or None
+    load_case_config=None,     # LoadCaseConfig or None
+    attachment_regions=None,   # list[AttachmentRegion] or None (Phase 5)
 ) -> dict:
     """
     Returns {"fixed_dofs": u32, "load_dofs": u32, "load_vals": f64}.
 
     If load_case_config is provided (Phase 2), uses declarative face selection.
     Otherwise falls back to legacy top-load / corner-fix behavior.
+
+    Phase 5: if attachment_regions are provided, their fixed DOFs are merged
+    (union) with any DOFs from load_case_config.fixed.  When
+    load_case_config.fixed is None, attachment_regions are the sole source
+    of fixity — this is the correct configuration for the motor mount and
+    any part where the attachment slab owns the wall BC.
     """
     nx = grid_config["nx"]
     ny = grid_config["ny"]
@@ -216,13 +263,34 @@ def build_load_case(
     h  = grid_config["voxel_size"]
 
     if load_case_config is not None:
-        # ── Phase 2: declarative load case ───────────────────────────────
-        fixed_dofs = _fixed_dofs_from_config(
-            load_case_config.fixed, geometry_params, nx, ny, nz, h
+        # ── Phase 2 + 5: declarative load case ───────────────────────────
+
+        # Fixed DOFs: from load_case_config.fixed if present
+        if load_case_config.fixed is not None:
+            fixed_dofs = _fixed_dofs_from_config(
+                load_case_config.fixed, geometry_params, nx, ny, nz, h
+            )
+        else:
+            fixed_dofs = np.array([], dtype=np.uint32)
+
+        # Phase 5: merge attachment region fixed DOFs
+        if attachment_regions:
+            attachment_fixed = _fixed_dofs_from_attachment_regions(
+                attachment_regions, nx, ny, nz
+            )
+            if len(attachment_fixed) > 0:
+                fixed_dofs = np.union1d(fixed_dofs, attachment_fixed).astype(np.uint32)
+
+        assert len(fixed_dofs) > 0, (
+            "build_load_case produced an empty fixed_dofs array. "
+            "Provide load_case_config.fixed OR attachment_regions with "
+            "bc != 'none'. An empty fixed set makes the stiffness matrix singular."
         )
+
         load_dofs, load_vals = _load_dofs_from_config(
             load_case_config.load, geometry_params, nx, ny, nz, h
         )
+
     else:
         # ── Legacy: top-load, corner-fix ─────────────────────────────────
         load_n = float(load_hints.load_magnitude_n)
@@ -462,6 +530,40 @@ def _fixed_dofs_from_config(cfg, geom, nx, ny, nz, h):
         [3 * int(n) + d for n in selected for d in range(3)],
         dtype=np.uint32,
     )
+
+
+def _fixed_dofs_from_attachment_regions(attachment_regions, nx, ny, nz):
+    """
+    Derive fixed DOFs from AttachmentRegion bc fields.
+
+    "fixed_full"  — fixes every node on the outboard face of the slab
+                    (resolved via region.resolved_bc_face()).
+    "none"        — no DOFs emitted for this region.
+
+    Returns a sorted, deduplicated uint32 array.  Returns an empty array
+    (length 0) if all regions have bc="none".
+
+    This function intentionally does NOT receive h (voxel size) because
+    _face_nodes() generates nodes by index, not by coordinate.  The node
+    index mapping is independent of voxel size.
+    """
+    all_fixed = []
+    for region in attachment_regions:
+        if region.bc == "none":
+            continue
+        if region.bc == "fixed_full":
+            face = region.resolved_bc_face()
+            nodes = _face_nodes(face, nx, ny, nz)
+            all_fixed.extend(3 * n + d for n in nodes for d in range(3))
+        else:
+            raise ValueError(
+                f"Unknown AttachmentRegion bc: '{region.bc}'. "
+                f"Valid options: fixed_full, none"
+            )
+
+    if not all_fixed:
+        return np.array([], dtype=np.uint32)
+    return np.array(sorted(set(all_fixed)), dtype=np.uint32)
 
 
 def _load_dofs_from_config(cfg, geom, nx, ny, nz, h):

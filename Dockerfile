@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 SHELL ["/bin/bash", "-c"]
 
+RUN echo "/usr/local/cuda-12.6/lib64" > /etc/ld.so.conf.d/cuda-pipeline.conf && ldconfig
+
 RUN pip install --no-cache-dir \
         gmsh==4.12.2 \
         vtk==9.3.1 \
@@ -39,7 +41,8 @@ RUN pip install --no-cache-dir \
         scipy \
         tqdm \
         h5py \
-        meshio && \
+        meshio \
+        fast-simplification && \
     python -m ipykernel install --user --name "fenics-pipeline" --display-name "FEniCSx Pipeline"
 
 RUN openscad --version 2>&1 | grep -q "OpenSCAD" || (echo "OpenSCAD install failed" && exit 1)

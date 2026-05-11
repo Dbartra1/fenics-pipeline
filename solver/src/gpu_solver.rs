@@ -187,6 +187,45 @@ impl GpuK {
         })
     }
 
+    // ── Convenience alias ────────────────────────────────────────────────────
+
+    /// Alias for `upload()`. Preferred name; `upload()` kept for compat.
+    #[inline]
+    pub fn new(k_rows: &[usize], k_cols: &[usize], k_vals: &[f64]) -> Result<Self, String> {
+        Self::upload(k_rows, k_cols, k_vals)
+    }
+
+    // ── Per-iteration value update ────────────────────────────────────────────
+
+    /// Update K values and re-run ILU(0) factorization (no analysis re-run).
+    ///
+    /// Call every SIMP iteration after reassembling k_vals. The sparsity
+    /// structure is unchanged so `new()`'s analysis results are reused.
+    /// Cost: 2× H2D memcpy + ILU factorize only.
+    pub fn refactor(&mut self, k_vals: &[f64]) -> Result<(), String> {
+        let n   = self.n   as i32;
+        let nnz = self.nnz as i32;
+        unsafe {
+            // Update K values for SpMV (mat_K descriptor already points to p_val)
+            result::memcpy_htod_sync(self.p_val, k_vals)
+                .map_err(|e| format!("[gpu] refactor p_val: {e}"))?;
+            // Reset ILU buffer to fresh K before factorization overwrites it
+            result::memcpy_htod_sync(self.p_ilu_val, k_vals)
+                .map_err(|e| format!("[gpu] refactor p_ilu_val: {e}"))?;
+            // Re-factorize reusing the existing info_ilu from analysis
+            let pol = cusp::cusparseSolvePolicy_t::CUSPARSE_SOLVE_POLICY_NO_LEVEL;
+            cusp::cusparseDcsrilu02(
+                self.handle, n, nnz, self.descr_M,
+                self.p_ilu_val as *mut f64,
+                self.p_row     as *const i32,
+                self.p_col     as *const i32,
+                self.info_ilu, pol,
+                self.p_ilu_buf as *mut std::ffi::c_void,
+            ).result().map_err(|e| format!("[gpu] refactor ILU02: {e:?}"))?;
+        }
+        Ok(())
+    }
+
     // ── Primary solve path (Tier 5 Session 2) ────────────────────────────────
 
     /// Solve K·u = f entirely on GPU.  Called once per SIMP step.
@@ -209,10 +248,12 @@ impl GpuK {
         // ── Upload once ───────────────────────────────────────────────────────
         // u = 0, r = f on device.
         // memset via zero-vec upload: simple and correct (IEEE 754 +0.0 = 0x00…).
-        let zeros = vec![0.0_f64; n];
+        // Warm start: upload the caller's current u (from previous SIMP iteration).
+        // On the very first iteration simp.rs initialises u=zeros, so this is
+        // correct for both cold-start and warm-start without special-casing.
         unsafe {
-            if result::memcpy_htod_sync(self.p_u, &zeros).is_err() {
-                eprintln!("[gpu_cg] upload zeros failed");
+            if result::memcpy_htod_sync(self.p_u, u).is_err() {
+                eprintln!("[gpu_cg] upload u (warm-start) failed");
                 return CgResult { iterations: 0, rel_residual: f64::INFINITY, converged: false };
             }
             if result::memcpy_htod_sync(self.p_r, f).is_err() {
