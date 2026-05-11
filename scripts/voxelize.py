@@ -11,6 +11,9 @@
 #           voxelize_domain() marks the slab nondesign then punches bolt voids.
 #           build_load_case() derives fixed DOFs from the slab face.
 #           LoadCaseConfig.fixed may be None when attachment_regions own fixity.
+# Session 6: bolt_pattern load selector added to _load_dofs_from_config().
+#             Selects N discrete disk patches (one per bolt center) rather than
+#             the full face, producing physically correct point-load topology.
 
 import math
 
@@ -570,17 +573,23 @@ def _load_dofs_from_config(cfg, geom, nx, ny, nz, h):
     """Build load DOF and value arrays from LoadFaceConfig.
 
     Args:
-        cfg:  LoadFaceConfig (face, selector, direction, magnitude_n, disk_radius_m)
+        cfg:  LoadFaceConfig (face, selector, direction, magnitude_n,
+                             disk_radius_m, bolt_centers_m)
         geom: GeometryParams (needed by 'center_disk' selector)
         nx, ny, nz, h: grid dimensions and voxel size
 
     Supported selectors:
-        full        — distribute load over every node on the face
-        center_disk — concentrate load on a disk centred on the face
+        full         — distribute load over every node on the face
+        center_disk  — concentrate load on a disk centred on the face
+        bolt_pattern — concentrate load on N disks, one per bolt center.
+                       Each disk uses disk_radius_m; disks are deduplicated
+                       via np.unique so overlapping bolt positions don't
+                       double-count. bolt_centers_m must be provided in cfg.
     """
     nodes_arr, ca, cb = _face_node_coords(cfg.face, nx, ny, nz, h)
 
-    # Select which nodes receive load
+    # ── Select which nodes receive load ───────────────────────────────────
+
     if cfg.selector == "full":
         selected = nodes_arr
 
@@ -593,10 +602,32 @@ def _load_dofs_from_config(cfg, geom, nx, ny, nz, h):
         mask = dist < cfg.disk_radius_m
         selected = nodes_arr[mask]
 
+    elif cfg.selector == "bolt_pattern":
+        # Repeated disk selection — one disk per bolt center.
+        # cfg.bolt_centers_m: list of [ca, cb] pairs in face-local coords.
+        #   x_min / x_max  →  ca = Y,  cb = Z
+        #   y_min / y_max  →  ca = X,  cb = Z
+        #   z_min / z_max  →  ca = X,  cb = Y
+        # cfg.disk_radius_m: radius of each individual bolt contact patch.
+        # Overlapping disks are deduplicated via np.unique so adjacent bolts
+        # that share nodes don't double-count their contribution to the total
+        # force (force_per_node is computed AFTER deduplication).
+        all_selected = []
+        for ca_c, cb_c in cfg.bolt_centers_m:
+            dist = np.sqrt((ca - ca_c) ** 2 + (cb - cb_c) ** 2)
+            all_selected.extend(nodes_arr[dist < cfg.disk_radius_m].tolist())
+        if not all_selected:
+            raise AssertionError(
+                f"bolt_pattern selected no nodes — check bolt_centers_m coords "
+                f"and disk_radius_m={cfg.disk_radius_m} relative to voxel size. "
+                f"face={cfg.face}, centers={cfg.bolt_centers_m}"
+            )
+        selected = np.unique(np.array(all_selected, dtype=nodes_arr.dtype))
+
     else:
         raise ValueError(
             f"Unknown load selector: '{cfg.selector}'. "
-            f"Valid options: full, center_disk"
+            f"Valid options: full, center_disk, bolt_pattern"
         )
 
     n_selected = len(selected)
@@ -606,7 +637,7 @@ def _load_dofs_from_config(cfg, geom, nx, ny, nz, h):
         f"Check that disk_radius_m is large enough relative to voxel size."
     )
 
-    # Normalise direction vector
+    # ── Normalise direction vector ─────────────────────────────────────────
     direction = np.array(cfg.direction, dtype=np.float64)
     norm = np.linalg.norm(direction)
     if norm > 0:

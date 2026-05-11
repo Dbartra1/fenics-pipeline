@@ -131,7 +131,7 @@ class TestOpenSCADDefinesFilter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task 2: FixedFaceConfig accepts "leg_holes" selector
+# Task 2: FixedFaceConfig selector validation
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestFixedFaceConfig:
@@ -147,21 +147,33 @@ class TestFixedFaceConfig:
         f.validate()
 
     def test_leg_holes_selector_valid(self):
-        """NEW: leg_holes selector must pass validation."""
+        """leg_holes selector must pass validation."""
         f = FixedFaceConfig(face="z_min", selector="leg_holes",
                             disk_radius_m=0.004)
+        f.validate()
+
+    def test_center_disk_selector_valid(self):
+        """center_disk selector must pass validation."""
+        f = FixedFaceConfig(face="z_min", selector="center_disk",
+                            disk_radius_m=0.006)
         f.validate()
 
     def test_unknown_selector_rejected(self):
         with pytest.raises(AssertionError, match="selector must be one of"):
             FixedFaceConfig(face="z_min", selector="triangles").validate()
 
-    def test_valid_selectors_includes_all_three(self):
-        assert FixedFaceConfig.VALID_SELECTORS == {"full", "corners", "leg_holes"}
+    def test_valid_selectors_contains_expected(self):
+        """All known selectors must be present in VALID_SELECTORS."""
+        # Test membership rather than exact equality so adding future selectors
+        # doesn't require updating this test — only the rejection test matters
+        # for exact-set semantics.
+        for selector in ("full", "corners", "leg_holes", "center_disk"):
+            assert selector in FixedFaceConfig.VALID_SELECTORS, \
+                f"'{selector}' missing from FixedFaceConfig.VALID_SELECTORS"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Task 2: LoadFaceConfig accepts "center_disk" selector
+# Task 2: LoadFaceConfig selector validation
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestLoadFaceConfig:
@@ -173,10 +185,20 @@ class TestLoadFaceConfig:
         l.validate()
 
     def test_center_disk_selector_valid(self):
-        """NEW: center_disk selector passes validation."""
+        """center_disk selector passes validation."""
         l = LoadFaceConfig(face="z_max", selector="center_disk",
                            magnitude_n=5000.0, disk_radius_m=0.004)
         l.validate()
+
+    def test_bolt_pattern_selector_valid(self):
+        """bolt_pattern selector passes validation when centers are provided."""
+        l = LoadFaceConfig(
+            face="x_max", selector="bolt_pattern",
+            bolt_centers_m=[[0.0145, 0.0245], [0.0455, 0.0555]],
+            disk_radius_m=0.007, direction=[0.0, 0.0, -1.0],
+            magnitude_n=5000.0,
+        )
+        l.validate()  # must not raise
 
     def test_center_disk_requires_positive_radius(self):
         with pytest.raises(AssertionError, match="disk_radius_m must be > 0"):
@@ -187,8 +209,11 @@ class TestLoadFaceConfig:
         with pytest.raises(AssertionError, match="selector must be one of"):
             LoadFaceConfig(face="z_max", selector="spiral").validate()
 
-    def test_valid_selectors(self):
-        assert LoadFaceConfig.VALID_SELECTORS == {"full", "center_disk"}
+    def test_valid_selectors_contains_expected(self):
+        """All known selectors must be present in VALID_SELECTORS."""
+        for selector in ("full", "center_disk", "bolt_pattern"):
+            assert selector in LoadFaceConfig.VALID_SELECTORS, \
+                f"'{selector}' missing from LoadFaceConfig.VALID_SELECTORS"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,6 +244,34 @@ class TestLiveJSONCompat:
         # All bolt seats should be along x axis (wall-to-motor direction)
         for bs in p.bolt_seats:
             assert bs.type == "bolt_seat_x"
+
+    def test_motor_mount_uses_bolt_pattern_load(self):
+        """Session 6: motor mount load selector must be bolt_pattern."""
+        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
+        p = PipelineParams.from_dict(raw)
+        assert p.load_case_config.load.selector == "bolt_pattern", (
+            "motor_mount load selector should be 'bolt_pattern' after Session 6 fix"
+        )
+        assert p.load_case_config.load.bolt_centers_m is not None
+        assert len(p.load_case_config.load.bolt_centers_m) == 4, \
+            "motor_mount should have 4 NEMA bolt centers"
+
+    def test_motor_mount_has_two_attachment_regions(self):
+        """Session 6: motor mount must have both wall and motor face slabs."""
+        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
+        p = PipelineParams.from_dict(raw)
+        assert len(p.attachment_regions) == 2, (
+            "motor_mount should have 2 attachment_regions "
+            "(wall slab x_min and motor face slab x_max)"
+        )
+
+    def test_motor_mount_entry_seat_true(self):
+        """Session 6: bolt_seat entry_seat must be True after Bug P3 fix."""
+        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
+        p = PipelineParams.from_dict(raw)
+        for bs in p.bolt_seats:
+            assert bs.entry_seat is True, \
+                f"bolt_seat entry_seat should be True, got {bs.entry_seat}"
 
     def test_base_part_load_defaults_to_full(self):
         """base_part.json has no `selector` on load → should default to 'full'."""

@@ -13,6 +13,9 @@
 #           nondesign voxels AND the boundary condition for the solver.
 #           LoadCaseConfig.fixed is now Optional; when None, the BC is
 #           derived entirely from attachment_regions.
+# Session 6: LoadFaceConfig gains bolt_pattern selector + bolt_centers_m field.
+#             BoltSeatRegion gains optional load field (architectural stub;
+#             wired into build_load_case in Phase 6).
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
@@ -146,33 +149,43 @@ class LoadFaceConfig:
     """
     Declarative load specification for the Rust solver path.
 
-    face:          which face receives the traction load
-    selector:      "full"        → distribute load uniformly across the
-                                   entire face (legacy / default behaviour)
-                   "center_disk" → concentrate load on a central disk patch.
-                                   The XY centre of the disk is resolved per
-                                   part shape via region_factory.part_center_m:
-                                     shape="disk" → (diameter/2, diameter/2)
-                                     shape="box" / absent → (length/2, width/2)
-                                   Use this when the physical load path runs
-                                   through a specific mounting feature (e.g.
-                                   the central bolt of a tripod mount) rather
-                                   than the entire face.
-    direction:     [x, y, z] unit vector (will be normalised internally)
-    magnitude_n:   total force in Newtons, distributed across the selected DOFs
-    disk_radius_m: radius of the loaded disk in metres (selector="center_disk"
-                   only). Size this to match the real contact patch — too
-                   small approaches a point load and produces stress
-                   singularities that dominate SIMP convergence.
+    face:           which face receives the traction load
+    selector:       "full"         → distribute load uniformly across the
+                                     entire face (legacy / default behaviour)
+                    "center_disk"  → concentrate load on a single disk centred
+                                     on the face. Use when load runs through a
+                                     central mounting feature (e.g. tripod bolt).
+                    "bolt_pattern" → concentrate load on N disks, one per bolt
+                                     position. Use for bolted connections where
+                                     the motor/load transfers force through
+                                     discrete fasteners, not face pressure.
+                                     Requires bolt_centers_m (list of [a,b]
+                                     face-local coordinate pairs in metres).
+    direction:      [x, y, z] unit vector (normalised internally)
+    magnitude_n:    total force in Newtons, distributed across selected DOFs
+    disk_radius_m:  radius of the loaded disk/disks in metres.
+                    For "center_disk": single central disk.
+                    For "bolt_pattern": radius of each individual bolt disk
+                    (typically matches bolt_seat wall_radius_m so load lands
+                    on the collar region).
+                    Ignored for "full".
+    bolt_centers_m: list of [a, b] face-local center coordinates in metres.
+                    Required when selector="bolt_pattern"; ignored otherwise.
+                    Coordinate convention matches _face_node_coords:
+                      x_min / x_max faces  →  a=Y,  b=Z
+                      y_min / y_max faces  →  a=X,  b=Z
+                      z_min / z_max faces  →  a=X,  b=Y
     """
-    face:          str   = "z_max"
-    selector:      str   = "full"
-    direction:     List  = field(default_factory=lambda: [0.0, 0.0, -1.0])
-    magnitude_n:   float = 10000.0
-    disk_radius_m: float = 0.010
+    face:           str            = "z_max"
+    selector:       str            = "full"
+    direction:      List           = field(default_factory=lambda: [0.0, 0.0, -1.0])
+    magnitude_n:    float          = 10000.0
+    disk_radius_m:  float          = 0.010
+    # bolt_pattern selector only: list of [a, b] in-plane center coords in metres.
+    bolt_centers_m: Optional[List] = None
 
     VALID_FACES     = {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}
-    VALID_SELECTORS = {"full", "center_disk"}
+    VALID_SELECTORS = {"full", "center_disk", "bolt_pattern"}
 
     def validate(self) -> None:
         assert self.face in self.VALID_FACES, \
@@ -182,6 +195,14 @@ class LoadFaceConfig:
         assert len(self.direction) == 3, "direction must be [x, y, z]"
         assert self.magnitude_n > 0, "magnitude_n must be > 0"
         assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
+        if self.selector == "bolt_pattern":
+            assert self.bolt_centers_m is not None and len(self.bolt_centers_m) > 0, (
+                "bolt_pattern selector requires bolt_centers_m "
+                "(non-empty list of [a, b] pairs in metres)"
+            )
+            for c in self.bolt_centers_m:
+                assert len(c) == 2, \
+                    f"each bolt center must be [a, b], got {c}"
 
 
 @dataclass
@@ -324,18 +345,25 @@ class BoltSeatRegion:
     exit_seat:       if True, emit a solid collar at the high-coord face.
                      Default True.  Setting either to False models a blind
                      bolt (one-sided anchor).
+    load:            Optional load applied at the exit-seat face for this bolt
+                     group. Format: {"direction": [x,y,z], "magnitude_n": float}
+                     When set, build_load_case() can accumulate these loads
+                     automatically, eliminating a separate load_case.load entry
+                     and making it impossible for the load case to contradict
+                     the geometry. Phase 6 wire-up: build_load_case() bolt_seats
+                     parameter. Currently a schema stub — not yet accumulated.
 
-    Example: 4 NEMA-17 motor bolts, 4mm through-hole, 3mm collar,
-    5mm seat depth from the x_max face only (motor plate):
+    Example: 4 NEMA-17 motor bolts, 4mm through-hole, 7mm collar,
+    8mm seat depth from both faces:
 
         {
           "type": "bolt_seat_x",
           "centers_m": [[0.0145, 0.0245], [0.0455, 0.0245],
                         [0.0145, 0.0555], [0.0455, 0.0555]],
-          "void_radius_m": 0.002,
-          "wall_radius_m": 0.003,
-          "seat_depth_m":  0.005,
-          "entry_seat":    false,
+          "void_radius_m": 0.004,
+          "wall_radius_m": 0.007,
+          "seat_depth_m":  0.008,
+          "entry_seat":    true,
           "exit_seat":     true
         }
     """
@@ -344,8 +372,13 @@ class BoltSeatRegion:
     void_radius_m:  float
     wall_radius_m:  float
     seat_depth_m:   float
-    entry_seat:     bool = True
-    exit_seat:      bool = True
+    entry_seat:     bool           = True
+    exit_seat:      bool           = True
+    # Optional: load applied at the exit-seat face for this bolt group.
+    # Phase 6 wire-up — currently stored in schema but not accumulated by
+    # build_load_case(). Use load_case.load with selector="bolt_pattern"
+    # for the current production path.
+    load:           Optional[dict] = None
 
     VALID_TYPES = {"bolt_seat_x", "bolt_seat_y", "bolt_seat_z"}
 
@@ -362,6 +395,14 @@ class BoltSeatRegion:
         assert self.entry_seat or self.exit_seat, \
             "at least one of entry_seat or exit_seat must be True " \
             "(otherwise the bolt has no anchor points)"
+        if self.load is not None:
+            assert "direction" in self.load and "magnitude_n" in self.load, (
+                "BoltSeatRegion.load must have 'direction' and 'magnitude_n' keys"
+            )
+            assert len(self.load["direction"]) == 3, \
+                "BoltSeatRegion.load direction must be [x, y, z]"
+            assert float(self.load["magnitude_n"]) > 0, \
+                "BoltSeatRegion.load magnitude_n must be > 0"
 
 
 @dataclass

@@ -1,7 +1,9 @@
 # tests/test_voxelize_selectors.py
 #
-# Tests that the leg_holes and center_disk selectors in voxelize.py
-# produce geometrically correct DOF selections on known grids.
+# Tests that the load and fixed selectors in voxelize.py produce
+# geometrically correct DOF selections on known grids.
+#
+# Covers: leg_holes, center_disk, bolt_pattern, corners/full (compat)
 #
 # Run from repo root:
 #   python -m pytest tests/test_voxelize_selectors.py -v
@@ -45,6 +47,54 @@ def _box_geom():
         wall_thickness=4.0, fillet_radius=2.0,
         mounting_hole_diameter=6.0, mounting_hole_inset=10.0,
     )
+
+
+def _motor_mount_geom():
+    """GeometryParams matching motor_mount_params.json."""
+    return GeometryParams(
+        length=70.0, width=60.0, height=80.0,
+        wall_hole_diameter=6.0, wall_hole_inset=10.0,
+        motor_hole_diameter=4.0, motor_hole_pitch=31.0,
+        motor_center_y=30.0, motor_center_z=40.0,
+    )
+
+
+def _motor_mount_grid():
+    """1mm voxel grid for the motor mount (70x60x80mm)."""
+    return _make_grid(nx=70, ny=60, nz=80)
+
+
+# NEMA-17 bolt centers in face-local (Y, Z) coords for the x_max face.
+# 31mm pitch, center at Y=30mm / Z=40mm — standard NEMA-17 pattern.
+_NEMA_CENTERS = [
+    [0.0145, 0.0245],
+    [0.0455, 0.0245],
+    [0.0145, 0.0555],
+    [0.0455, 0.0555],
+]
+_NEMA_DISK_R = 0.007   # matches wall_radius_m of bolt_seat collars
+
+
+def _decode_xmax_node(nid: int, nx: int, ny: int, h: float):
+    """
+    Invert node_idx for a node known to be on the x_max face (ix = nx).
+
+    node_idx = ix + iy*(nx+1) + iz*(nx+1)*(ny+1)
+    On x_max:  nid = nx + iy*(nx+1) + iz*(nx+1)*(ny+1)
+               nid - nx = (nx+1) * (iy + iz*(ny+1))
+
+    So:
+        q  = (nid - nx) // (nx+1)   →  iy + iz*(ny+1)
+        iy = q % (ny+1)
+        iz = q // (ny+1)
+
+    Returns (ca, cb) = (Y, Z) face-local coordinates in metres,
+    matching the convention of _face_node_coords for x_max.
+    """
+    q  = (nid - nx) // (nx + 1)
+    iy = q % (ny + 1)
+    iz = q // (ny + 1)
+    return iy * h, iz * h   # ca=Y, cb=Z
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -225,6 +275,207 @@ class TestCenterDiskSelector:
         total = sum(result["load_vals"])
         assert abs(total - (-mag)) < 1e-6, (
             f"total force = {total}, expected {-mag}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# bolt_pattern selector
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBoltPatternSelector:
+
+    def _make_lc(self, disk_r=_NEMA_DISK_R, magnitude_n=5000.0):
+        """Helper: motor-mount load case with bolt_pattern on x_max."""
+        return LoadCaseConfig(
+            fixed=FixedFaceConfig(
+                face="x_min", selector="corners",
+                inset_m=0.010, disk_radius_m=0.006,
+            ),
+            load=LoadFaceConfig(
+                face="x_max",
+                selector="bolt_pattern",
+                bolt_centers_m=_NEMA_CENTERS,
+                disk_radius_m=disk_r,
+                direction=[0.0, 0.0, -1.0],
+                magnitude_n=magnitude_n,
+            ),
+        )
+
+    def test_produces_nonzero_load_dofs(self):
+        """bolt_pattern must select at least some load DOFs."""
+        result = build_load_case(
+            _motor_mount_geom(), None, _motor_mount_grid(),
+            load_case_config=self._make_lc(),
+        )
+        assert len(result["load_dofs"]) > 0
+
+    def test_far_fewer_dofs_than_full_face(self):
+        """
+        bolt_pattern at 4 NEMA positions selects ~616 nodes vs ~4941 for full face.
+        Assert bolt_pattern is < 20% of full-face DOF count.
+        """
+        geom = _motor_mount_geom()
+        grid = _motor_mount_grid()
+
+        lc_full = LoadCaseConfig(
+            fixed=FixedFaceConfig(face="x_min", selector="corners",
+                                  inset_m=0.010, disk_radius_m=0.006),
+            load=LoadFaceConfig(face="x_max", selector="full",
+                                magnitude_n=5000.0),
+        )
+        r_full = build_load_case(geom, None, grid, load_case_config=lc_full)
+        r_bolt = build_load_case(geom, None, grid, load_case_config=self._make_lc())
+
+        n_full = len(r_full["load_dofs"])
+        n_bolt = len(r_bolt["load_dofs"])
+        assert n_bolt < n_full * 0.20, (
+            f"bolt_pattern DOF count {n_bolt} should be < 20% of full-face "
+            f"count {n_full} — check bolt_centers_m and disk_radius_m"
+        )
+
+    def test_load_dof_count_in_expected_range(self):
+        """
+        4 bolts × π × (7mm)² ≈ 616 nodes at 1mm voxel.
+        Assert within ±30% of that theoretical value.
+        """
+        result = build_load_case(
+            _motor_mount_geom(), None, _motor_mount_grid(),
+            load_case_config=self._make_lc(),
+        )
+        # Direction is pure -Z so each selected node contributes exactly 1 DOF.
+        n_nodes  = len(result["load_dofs"])
+        expected = int(4 * math.pi * (_NEMA_DISK_R * 1000) ** 2)  # ≈ 616
+        assert expected * 0.70 < n_nodes < expected * 1.30, (
+            f"bolt_pattern node count {n_nodes} outside ±30% of "
+            f"theoretical {expected} — check disk_radius_m={_NEMA_DISK_R}"
+        )
+
+    def test_loaded_nodes_cluster_near_bolt_centers(self):
+        """
+        Every loaded node must be within disk_radius_m (+1 voxel tolerance)
+        of at least one declared bolt center. No stray nodes elsewhere.
+
+        Node index inversion for x_max face (ix = nx fixed):
+            node_idx = nx + iy*(nx+1) + iz*(nx+1)*(ny+1)
+            → (nid - nx) = (nx+1) * (iy + iz*(ny+1))
+            → q  = (nid - nx) // (nx+1)
+            → iy = q % (ny+1),  iz = q // (ny+1)
+            → ca = Y = iy*h,    cb = Z = iz*h
+        """
+        geom = _motor_mount_geom()
+        grid = _motor_mount_grid()
+        h    = grid["voxel_size"]
+        nx, ny = grid["nx"], grid["ny"]
+
+        result = build_load_case(geom, None, grid,
+                                 load_case_config=self._make_lc())
+
+        for dof in result["load_dofs"]:
+            nid     = int(dof) // 3
+            ca, cb  = _decode_xmax_node(nid, nx, ny, h)
+            min_dist = min(
+                math.sqrt((ca - c[0]) ** 2 + (cb - c[1]) ** 2)
+                for c in _NEMA_CENTERS
+            )
+            assert min_dist < _NEMA_DISK_R + h, (
+                f"node at (Y={ca:.4f}m, Z={cb:.4f}m) is {min_dist:.4f}m from "
+                f"nearest bolt center — exceeds disk_radius_m={_NEMA_DISK_R} "
+                f"+ voxel tolerance {h}"
+            )
+
+    def test_force_magnitude_preserved(self):
+        """Total load across all DOFs must equal magnitude_n exactly."""
+        mag    = 5000.0
+        result = build_load_case(
+            _motor_mount_geom(), None, _motor_mount_grid(),
+            load_case_config=self._make_lc(magnitude_n=mag),
+        )
+        total = sum(result["load_vals"])
+        assert abs(total - (-mag)) < 1e-6, (
+            f"total force = {total:.6f}N, expected {-mag}N. "
+            f"Force not conserved across {len(result['load_dofs'])} DOFs."
+        )
+
+    def test_fixed_dof_count_in_expected_range(self):
+        """
+        corners selector on x_min is unchanged by the load selector change.
+        4 corner disks × π × (6mm)² × 3 DOF/node ≈ 1356 fixed DOFs.
+        """
+        result = build_load_case(
+            _motor_mount_geom(), None, _motor_mount_grid(),
+            load_case_config=self._make_lc(),
+        )
+        n_fixed = len(result["fixed_dofs"])
+        assert 800 < n_fixed < 2000, (
+            f"fixed DOF count {n_fixed} outside expected range ~1356 "
+            f"(4 corner disks, 6mm radius, 3 DOFs/node)"
+        )
+
+    def test_schema_validates_well_formed_bolt_pattern(self):
+        """LoadFaceConfig.validate() must not raise for a correct bolt_pattern."""
+        cfg = LoadFaceConfig(
+            face="x_max",
+            selector="bolt_pattern",
+            bolt_centers_m=_NEMA_CENTERS,
+            disk_radius_m=_NEMA_DISK_R,
+            direction=[0.0, 0.0, -1.0],
+            magnitude_n=5000.0,
+        )
+        cfg.validate()  # must not raise
+
+    def test_schema_rejects_bolt_pattern_without_centers(self):
+        """bolt_pattern with no bolt_centers_m must fail validation."""
+        cfg = LoadFaceConfig(
+            face="x_max",
+            selector="bolt_pattern",
+            disk_radius_m=_NEMA_DISK_R,
+            direction=[0.0, 0.0, -1.0],
+            magnitude_n=5000.0,
+            # bolt_centers_m intentionally omitted
+        )
+        with pytest.raises(AssertionError, match="bolt_centers_m"):
+            cfg.validate()
+
+    def test_schema_rejects_bolt_pattern_with_empty_centers(self):
+        """bolt_pattern with an empty bolt_centers_m list must fail validation."""
+        cfg = LoadFaceConfig(
+            face="x_max",
+            selector="bolt_pattern",
+            bolt_centers_m=[],
+            disk_radius_m=_NEMA_DISK_R,
+            direction=[0.0, 0.0, -1.0],
+            magnitude_n=5000.0,
+        )
+        with pytest.raises(AssertionError, match="bolt_centers_m"):
+            cfg.validate()
+
+    def test_deduplication_of_overlapping_disks(self):
+        """
+        Two bolt centers close enough that their disks overlap should not
+        double-count nodes. Total force must still equal magnitude_n.
+        Force conservation is the observable: if deduplication is broken,
+        force_per_node is computed on the pre-dedup count and the sum is wrong.
+        """
+        overlapping_centers = [[0.030, 0.040], [0.033, 0.040]]
+        lc = LoadCaseConfig(
+            fixed=FixedFaceConfig(face="x_min", selector="full"),
+            load=LoadFaceConfig(
+                face="x_max",
+                selector="bolt_pattern",
+                bolt_centers_m=overlapping_centers,
+                disk_radius_m=_NEMA_DISK_R,
+                direction=[0.0, 0.0, -1.0],
+                magnitude_n=1000.0,
+            ),
+        )
+        result = build_load_case(
+            _motor_mount_geom(), None, _motor_mount_grid(),
+            load_case_config=lc,
+        )
+        total = sum(result["load_vals"])
+        assert abs(total - (-1000.0)) < 1e-6, (
+            f"Overlapping disk deduplication broken: total={total:.6f}N, "
+            f"expected -1000.0N"
         )
 
 

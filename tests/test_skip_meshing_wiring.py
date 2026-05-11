@@ -30,12 +30,24 @@ def _cell_source(nb_path: Path, idx: int) -> str:
 # NB02 — SKIP_MESHING flag and guards
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_nb02_params_declares_skip_meshing_default_false():
+def test_nb02_params_declares_skip_meshing():
+    """
+    SKIP_MESHING must be declared in NB02's params cell.
+
+    Current production default is True — the Rust voxel solver path
+    (NB04 USE_RUST_SOLVER=True) does not require a gmsh tet mesh, so NB02
+    is intentionally set to skip meshing and write a stub stage02 handoff.
+
+    If the repo ever reverts to the FEniCSx path as default, update this
+    assertion to check for False.
+    """
     src = _cell_source(NB02, 2)
     assert "SKIP_MESHING" in src, "SKIP_MESHING flag missing from NB02 params cell"
-    # Default must be False — legacy FEniCSx path must not silently regress.
-    assert "SKIP_MESHING     = False" in src or "SKIP_MESHING = False" in src, \
-        "SKIP_MESHING default must be False (preserves legacy behavior)"
+    # Rust solver path: SKIP_MESHING is intentionally True.
+    assert "SKIP_MESHING     = True" in src or "SKIP_MESHING = True" in src, \
+        ("SKIP_MESHING should be True (Rust solver path is active). "
+         "If reverting to FEniCSx path, set SKIP_MESHING = False in NB02 Cell 2 "
+         "and update this assertion.")
 
 
 def test_nb02_meshing_cell_guarded():
