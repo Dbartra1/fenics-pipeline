@@ -27,10 +27,16 @@
 # 12. Development Environment — container, paths, build commands
 # 13. Session Startup Protocol — the correct sequence to begin a work session
 #
-# LAST UPDATED: 2026-05-22
+# LAST UPDATED: 2026-06-04
 # CURRENT HEAD: main branch
-# TEST COUNT:   130 passing (cargo test --release)
-# SOLVER TIER:  Tier 4 complete — VCycle-PCG dispatch wired
+# TEST COUNT:   140 passing (cargo test --release)
+# SOLVER STATE: AMGCL AMG-PCG is the primary solver for n_dof ≥ 50k (smoothed
+#               aggregation + ILU(0) smoother, block_size=3, OpenMP); faer
+#               sparse Cholesky below 50k; CPU Jacobi-PCG as fallback and
+#               per-iteration corrector. Legacy GPU ILU(0)-PCG is deprecated
+#               (diverges under SIMP contrast; not in any default build).
+#               VCycle geometric multigrid is experimental and NOT in dispatch
+#               (assumes power-of-2 grids). See §3 for the dispatch tree.
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1113,7 +1119,7 @@ was rotated and/or mirrored incorrectly. The current NB05 is correct.
 
 ### Rust Unit Tests (cargo test)
 
-**Count**: 130 passing (as of Tier 4 Phase 6 completion)
+**Count**: 140 passing
 **Run**: `cargo test --release` from `solver/` directory
 **Time**: ~0.17s in release mode
 
@@ -1164,27 +1170,28 @@ docker exec -it fenics-pipeline bash -c "cd /workspace && python -m pytest tests
 
 ## 10. Known Tech Debt
 
-### TD-01: GPU Warm-Start Bug (HIGH PRIORITY — next GPU session)
+### TD-01: GPU Warm-Start — RESOLVED
 
 **File**: `solver/src/gpu_solver.rs`
-**Issue**: GPU CG solver zeroes `u` at entry, breaking the warm-start that
-the CPU path uses. The CPU path carries `u` from the previous iteration,
-which reduces CG iteration count by 20–40% in late SIMP iterations.
-**Impact**: GPU path is correct but uses more CG iterations than necessary.
-**Fix**: Pass `u` as an in-out parameter to `gpu_cg_solve` and initialise
-the device vector from the host `u` before the CG loop (H2D transfer of
-previous iteration's displacement at the start of each solve).
-**Estimated effort**: 1–2 hours (well-understood change, small surface area)
+**Status**: Implemented. `cg_solve_persistent()` uploads the caller's `u` as the
+CG initial guess (correct for both cold- and warm-start, no special-casing), so
+the GPU path no longer zeroes `u` on entry.
+**Note**: Moot in practice — the GPU ILU(0)-PCG path is deprecated (see §3; it
+diverges under SIMP contrast) and is dead code in any default `amgcl` build. The
+warm-start plumbing carries over to the Phase B AMGCL-CUDA path (roadmap R4).
 
-### TD-02: GPU SpMV via cudarc Not Yet Implemented
+### TD-02: GPU Persistent-K / Values-Only Update — RESOLVED
 
-**Context**: The GPU path currently uses cuSPARSE through the `cudarc` crate.
-The goal is to use cudarc for lower-level control over kernel dispatch and
-persistent K matrix on device across SIMP iterations (currently K is uploaded
-H2D every iteration even though only values change, not structure).
-**Target**: 3s/iter (currently ~3.6s/iter with ILU(0) CG, ~16s/iter CPU)
-**Status**: Planned, not started. RTX 4080 + CUDA 12.6 mounted and working.
-**Estimated effort**: 4–8 hours
+**File**: `solver/src/gpu_solver.rs`
+**Status**: Implemented. The CSR structure persists on the device (one
+`cusparseSpMatDescr_t` created once, row/col arrays uploaded once); `refactor()`
+does a values-only H2D copy of the K and ILU values each iteration and reuses the
+SpSV analysis. The CG loop runs device-side via cuBLAS, with only scalars (α, β,
+residual) returning to the host. The "K re-uploaded every iteration" concern is
+closed.
+**Note**: As with TD-01, this is on the deprecated GPU path and does not run in a
+default build. It is not the production bottleneck — the live performance lever is
+TD-07 (AMGCL rebuild) below. GPU story: §3 and roadmap R4.
 
 ### TD-03: SIMP_OVERRIDES Dict Injection via Papermill (LOW PRIORITY)
 
@@ -1227,14 +1234,27 @@ planned but not implemented.
 **Fix**: Add `/proc/self/status` VmRSS read or CUDA memory query.
 **Priority**: Very low.
 
-### TD-07: amgcl_solver.rs Experimental Status
+### TD-07: AMGCL Rebuilds the Full Hierarchy Every Iteration (HIGH — roadmap R2)
 
-**File**: `solver/src/amgcl_solver.rs`, `solver/vendor/amgcl/`
-**Status**: The amgcl algebraic multigrid wrapper is in the codebase but
-its integration into the dispatch path is unclear. The vendor directory
-contains the amgcl C++ headers. The build.rs compiles the amgcl wrapper.
-**Recommendation**: Do not build on amgcl until the geometric multigrid
-(VCycle) path is fully validated. amgcl is an alternative, not a successor.
+**File**: `solver/src/amgcl_solver.rs`, `solver/vendor/amgcl_wrapper.cpp`
+**Context**: AMGCL is the PRIMARY, default solver for n_dof ≥ 50k (smoothed
+aggregation + ILU(0), block_size=3, OpenMP) — not experimental, and it is the
+successor to the VCycle path, not an alternative to it. See §3.
+**Issue**: On every SIMP iteration after the first, `amgcl_update()` calls
+`rebuild()`, which runs `h->solver.reset(new SolverType(A, prm))` — a full
+reconstruction: re-aggregation, the full Galerkin coarse-operator hierarchy, and
+ILU(0) factorization at every level. The dispatch side calls this a values-only
+"refactor," but the AMGCL *setup* phase runs in full each time. The matrix
+structure is fixed across SIMP iterations (only values change), so the
+aggregation is reusable and most of this setup is redundant.
+**Impact**: For AMG on elasticity, setup is comparable to or costlier than a
+single solve; at ~1M DOF over 200–350 iterations this is plausibly a large
+fraction of the ~16 s/iter. Highest-value performance item on the active path.
+**Fix direction**: Investigate AMGCL preconditioner reuse — rebuild operators on
+the fixed aggregation rather than re-aggregating, and/or rebuild every N
+iterations (density changes slowly late in the run). Instrument setup-vs-solve
+timing first; the wrapper currently records neither.
+**Effort**: ~3–6 days (roadmap R2).
 
 
 ---
