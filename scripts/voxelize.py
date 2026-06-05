@@ -201,6 +201,20 @@ def voxelize_domain(
                     )
                     nondesign[collar_mask] = 1
 
+                # Through-ring: thin forced-solid annulus for the full axis
+                # length — the "invisible tube" that tells the optimizer the
+                # bolt path exists everywhere without consuming volume budget.
+                # Only the annulus between void_radius and through_ring_radius
+                # is forced solid; the void core is still free.
+                # Volume cost at 1mm voxels, 1mm ring, 70mm depth, 8 bolts:
+                #   π × ((r_ring+1)² - r_void²) × 70 × 8 ≈ 4.6% of budget
+                # vs full wall_radius ring which consumed 40% of budget.
+                if hasattr(region, 'through_ring_radius_m') \
+                        and region.through_ring_radius_m is not None:
+                    ring_r2 = region.through_ring_radius_m ** 2
+                    ring_mask = (r2 >= void_r2) & (r2 < ring_r2)
+                    nondesign[ring_mask] = 1
+
     # ── Phase 5: attachment regions ───────────────────────────────────────
     # Slab marked nondesign first, bolt voids punched through after.
     # The sequential two-step is what eliminates BC-void singularities:

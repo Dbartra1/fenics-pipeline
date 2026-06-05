@@ -379,6 +379,7 @@ class BoltSeatRegion:
     # build_load_case(). Use load_case.load with selector="bolt_pattern"
     # for the current production path.
     load:           Optional[dict] = None
+    through_ring_radius_m: Optional[float] = None
 
     VALID_TYPES = {"bolt_seat_x", "bolt_seat_y", "bolt_seat_z"}
 
