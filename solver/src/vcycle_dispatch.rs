@@ -9,7 +9,7 @@
 //       → faer sparse Cholesky  (exact, best for small n)
 //
 //   n_dof ≥ CHOLESKY_THRESHOLD,  feature "amgcl" compiled in  (default)
-//       → AMGCL AMG-PCG  (smoothed aggregation + SPAI0 smoother, OpenMP)
+//       → AMGCL AMG-PCG  (smoothed aggregation + ILU(0) smoother, OpenMP)
 //         Mesh-independent convergence: ~20-50 CG iterations regardless
 //         of stiffness contrast (handles condition numbers up to 10^12).
 //         If AMGCL init or hierarchy build fails permanently, falls through.
@@ -133,7 +133,7 @@ impl GpuContext {
                 // Phase B will return the CUDA label here.
                 return "AMGCL AMG-PCG (OpenMP now; Phase B: CUDA when use_gpu=true)";
             }
-            return "AMGCL AMG-PCG (OpenMP — smoothed aggregation + SPAI0 smoother)";
+            return "AMGCL AMG-PCG (OpenMP — smoothed aggregation + ILU(0) smoother)";
         }
 
         // Legacy GPU path (amgcl feature not active).

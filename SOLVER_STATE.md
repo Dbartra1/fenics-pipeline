@@ -704,15 +704,25 @@ takes ~500ms and the resulting direct solve is faster than 200 CG iterations.
 Above 50k, Cholesky fill-in becomes too large and CG is preferred. This
 threshold was determined empirically during Tier 4 development.
 
-**GPU context** (`GpuContext` struct in vcycle_dispatch.rs):
-Holds CUDA device handle and cuSPARSE handle. Initialized once at the start
-of `run_simp()` and passed through `solve_linear_system` each iteration.
-`GpuContext::new(use_gpu: bool)` — if `use_gpu=false`, all GPU calls are
-no-ops and the CPU path is used.
+**Solver context** (`GpuContext` struct in vcycle_dispatch.rs — the name is a
+misnomer kept for back-compat with simp.rs; it is the persistent *solver*
+context, not a GPU-only one). Constructed once at the start of `run_simp()` via
+`GpuContext::new(use_gpu)` and threaded through `solve_linear_system` on every
+iteration, so the context persists for the lifetime of a stage rather than being
+recreated per solve. It holds:
+- `amgcl_ctx` — the AMGCL AMG-PCG context, the **primary** solver; created
+  lazily on the first solve. (`feature = "amgcl"`, default.)
+- `inner` — lazy legacy GPU ILU(0) state, `Option<GpuK>`; bypassed entirely when
+  the `amgcl` feature is active. (`feature = "gpu"`.)
+- `use_gpu` — a forward-looking *intent* flag. In the current default build it is
+  **ignored for routing**: AMGCL OpenMP runs regardless of its value. It is
+  reserved for Phase B (selecting AMGCL's CUDA vs builtin backend) and does NOT
+  switch between CPU and GPU today.
 
-`gpu_ctx.backend_label()` — returns a human-readable string for the log line:
-`"GPU ILU(0)-CG"`, `"CPU VCycle-PCG"`, or `"CPU Cholesky"`.
-
+`gpu_ctx.backend_label()` — returns a human-readable string, printed once at SIMP
+startup, identifying the active backend: an AMGCL label in the default build, a
+`[DEPRECATED]` legacy-GPU label only under `--no-default-features --features gpu`,
+or a CPU (Jacobi-PCG / Cholesky) label as the fallback.
 
 ---
 
