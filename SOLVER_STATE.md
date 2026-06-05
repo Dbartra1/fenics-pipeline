@@ -673,23 +673,30 @@ and is never consumed from JSON (only from binary).
 Full decision tree for `vcycle_dispatch::solve_linear_system`:
 
 ```
-                      ┌─────────────────────┐
-                      │  solve_linear_system │
-                      └──────────┬──────────┘
-                                 │
-                    n_dof < 50,000?
-                   ┌─────┴─────┐
-                  YES          NO
-                   │            │
-          faer Cholesky      use_gpu?
-          (solver.rs)       ┌────┴────┐
-          exact, fast      YES        NO
-                            │          │
-                    cuSPARSE ILU(0)-CG  VCycle-PCG
-                    (gpu_solver.rs)     (multigrid.rs
-                    RTX 4080 path       + solver.rs)
-                    ~3-4s/iter          ~16s/iter CPU
-                    [warm-start bug]    [correct]
+                       ┌───────────────────────┐
+                       │  solve_linear_system  │
+                       └───────────┬───────────┘
+                                   │
+                  n_dof < 50,000  (CHOLESKY_THRESHOLD)?
+                      ┌────────────┴────────────┐
+                     YES                         NO
+                      │                          │
+            faer sparse Cholesky       feature "amgcl"  (DEFAULT)?
+            (solver.rs)               ┌────────────┴────────────┐
+            exact, direct            YES                        NO
+                                      │                          │
+                           AMGCL AMG-PCG          feature "gpu" + use_gpu?
+                           ══ PRIMARY ══          ┌────────────┴────────────┐
+                           amgcl_solver.rs +     YES                        NO
+                           amgcl_wrapper.cpp      │                          │
+                           smoothed aggregation,  GPU ILU(0)-PCG      CPU Jacobi-PCG
+                           ILU(0) smoother,       (gpu_solver.rs)     (solver.rs)
+                           block_size=3, OpenMP   ~3-4 s/iter         ultimate fallback
+                           ~16 s/iter             [LEGACY — broken
+                           residual gate @ 0.1:    for high contrast]
+                           dirty → Jacobi 1 iter  correct @ iter 1,
+                                                  diverges @ iter 6+;
+                                                  dead in default build
 ```
 
 **50k DOF threshold rationale**: At 50k DOFs, faer Cholesky factorization
