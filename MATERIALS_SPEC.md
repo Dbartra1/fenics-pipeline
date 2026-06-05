@@ -1405,3 +1405,221 @@ due to the KDTree query — about 100× more expensive. Never rebuild mid-run.
 | Python source change has no effect            | Clear __pycache__, restart kernel   |
 | Fresh run resumes old checkpoint              | rm outputs/problem/checkpoint.bin   |
 | Stage04 has wrong params                      | Check if NB04 completed fully       |
+
+
+---
+
+## 17. Shell Enforcement (NB05 Post-Processing)
+
+### What It Is
+
+Shell enforcement is a post-processing step applied to the density array
+BEFORE marching cubes runs in NB05. It forces the outer voxels of selected
+faces to solid (density=1.0), creating a continuous closed skin that encloses
+whatever the optimizer built inside. The key architectural property is that
+it operates on the same density array that marching cubes consumes — the shell
+and the interior structure are one continuous field, not two geometries being
+joined. This avoids the junction artifacts that plagued the slab approach.
+
+### Why It Is Necessary
+
+SIMP compliance minimization has no connectivity constraint. For a motor mount
+with 4 fixed disks on x_min and 4 load disks on x_max, the mathematically
+optimal topology is 4 independent load paths (struts) — one connecting each
+fixed point to its nearest load point. These struts are disconnected from each
+other because no force requires them to be connected.
+
+Shell enforcement solves this by giving all struts a common plate to attach
+to at each end. The struts themselves are unchanged; they are enclosed within
+the shell rather than replaced by it.
+
+### Void-Aware Mechanism
+
+The shell MUST respect the void_mask from the optimizer. If the shell blindly
+forces all outer voxels to solid, it fills the bolt holes. The implementation
+loads `outputs/problem/void.bin` and applies:
+
+    density_shelled[face_slice] = np.where(void_mask[face_slice],
+                                            density[face_slice],   # preserve void
+                                            1.0)                   # force solid
+
+This means: voxels that the solver declared void stay void; everything else
+on the selected face gets forced solid.
+
+### Parameters (Cell 0 of NB05)
+
+```python
+SHELL_ENFORCE_FACES = ["x_min", "x_max", "y_min", "y_max"]
+SHELL_THICKNESS_MM  = 8.0   # mm — must match or exceed bolt_seat seat_depth_m
+```
+
+**SHELL_ENFORCE_FACES**: which faces to reinforce.
+- `["x_min", "x_max"]` — wall plate + motor plate only (minimal)
+- `["x_min", "x_max", "y_min", "y_max"]` — full frame including side walls
+  (confirmed working for motor mount)
+- `[]` — disabled (pass-through, no shell)
+
+**SHELL_THICKNESS_MM**: must be ≥ `seat_depth_m` from bolt_seats in params.json.
+If SHELL_THICKNESS_MM < seat_depth_m, the shell does not reach the strut
+anchor zone and Taubin smoothing removes the thin shell between anchor points.
+
+CONFIRMED WORKING: SHELL_THICKNESS_MM=8.0 with seat_depth_m=0.015 (15mm).
+Shell thickness of 2mm was confirmed INSUFFICIENT — smoothing erased it.
+
+### What SHELL_THICKNESS_MM Should NOT Be
+
+Setting SHELL_THICKNESS_MM=15.0 (matching seat_depth_m exactly) creates a
+very thick forced-solid region that the optimizer's struts must terminate
+into. This works structurally but produces excessive forced material. 8mm is
+the confirmed sweet spot: thick enough to survive smoothing, thin enough to
+leave the optimizer with a meaningful interior design space.
+
+---
+
+## 18. Through-Ring Passive Elements
+
+### The Concept
+
+A through-ring is a thin forced-solid annulus around each bolt void that runs
+the FULL axis length of the part. It is the answer to the question: "how do
+we tell the optimizer the bolt path exists without consuming the volume budget?"
+
+The optimizer sees:
+- Void core (bolt hole): radius = void_radius_m, full axis length
+- Forced-solid ring: void_radius_m < r < through_ring_radius_m, full axis
+- Design space: r > through_ring_radius_m, optimizer decides
+
+The ring is "invisible" in the sense that it does not become significant STL
+geometry — it is 1mm thick at 1mm voxels, a single annular shell. But it
+tells the optimizer that material must exist around the bolt path everywhere,
+not just at the entry/exit collar zones.
+
+### Why Previous Approaches Failed
+
+**Full-depth collar (wall_radius_m full length):** Forces a thick cylinder of
+nondesign material for the entire part depth. At 8mm collar radius, 70mm
+depth, 8 bolts: ~93,000 mm³ = 40% of total material budget consumed before
+optimization. The optimizer has no freedom and produces 8 solid columns with
+minimal bridging material. CONFIRMED FAILURE.
+
+**Entry/exit collar only (original bolt_seat):** The collar ring only exists
+for 15mm at each end. The middle 40mm has a void core floating in free space
+with no incentive for the optimizer to surround it. Marching cubes produces
+clean bores at the collar zones and open channels in the middle. CONFIRMED
+FAILURE (produces corner cutouts instead of through-holes).
+
+**Through-ring (current implementation):** 1mm annulus, full depth. Volume
+cost: π×((4²−3²))×70×8 ≈ 15,400 mm³ = 4.6% of budget. CONFIRMED WORKING.
+
+### Volume Budget Math
+
+At 1mm voxels for a motor mount (70×60×80mm = 336,000 element grid):
+
+    through_ring volume = π × (r_ring² − r_void²) × axis_length × n_bolts
+                       = π × (0.007² − 0.006²) × 0.070 × 8  [m³]
+                       = π × (4.9e-5 − 3.6e-5) × 0.560
+                       ≈ 2.29e-5 m³ = 22,900 mm³
+
+    Grid total volume = 70 × 60 × 80 = 336,000 mm³
+    Budget fraction   = 22,900 / 336,000 = 6.8%
+
+6.8% of budget gives the optimizer clear anchor geometry without dominating.
+By comparison, the failed full-collar approach consumed 40%.
+
+### Implementation
+
+**voxelize.py** — added after existing entry/exit collar logic in Phase 4:
+
+```python
+if hasattr(region, 'through_ring_radius_m') \
+        and region.through_ring_radius_m is not None:
+    ring_r2  = region.through_ring_radius_m ** 2
+    ring_mask = (r2 >= void_r2) & (r2 < ring_r2)
+    nondesign[ring_mask] = 1
+```
+
+No `axis_coord` constraint — the ring applies for the full axis length.
+The `r2 >= void_r2` condition ensures the void core is not overwritten.
+
+**param_schema.py** — `BoltSeatRegion` dataclass:
+
+```python
+through_ring_radius_m: Optional[float] = None
+```
+
+Optional field, defaults None (backward compatible — existing params.json
+files without this field behave identically to before).
+
+**motor_mount_params.json** — both bolt_seat groups:
+
+```json
+"through_ring_radius_m": 0.007
+```
+
+This sets a 1mm ring (void=6mm, ring=7mm) for all 8 bolts.
+
+### Confirmed Results
+
+Motor mount run with through_ring_radius_m=0.007:
+- Both x_min (wall) and x_max (motor) faces show clean bolt holes
+- Holes are surrounded by material rather than being corner cutouts
+- Compliance: 0.03583 J (best result yet — optimizer building better
+  structure around the ring anchor points)
+- Safety factor: 11.09 (PASS)
+- Watertight: true, open edges: 0
+
+### Tuning Guide
+
+| through_ring_radius_m | Effect |
+|---|---|
+| None | No ring — entry/exit collar only (old behavior) |
+| void_radius + 0.001 | 1mm ring — minimal volume cost, clean bores |
+| void_radius + 0.002 | 2mm ring — cleaner marching cubes surface at holes |
+| void_radius + 0.005 | 5mm ring — approaches failed full-collar behavior |
+
+Start at void_radius + 0.001. Increase by 0.001 at a time if holes are
+still irregular in the STL. Do not exceed void_radius + 0.003 without
+re-checking the volume budget fraction.
+
+---
+
+## 19. Confirmed Working Configuration (Motor Mount v3)
+
+This is the confirmed production configuration as of 2026-05-24.
+Use as the reference baseline for new parts.
+
+### Optimization Parameters
+```
+VOXEL_SIZE_MM:    1.0
+VOLUME_FRACTION:  0.38
+FILTER_RADIUS:    3.0  (3× voxel size — confirmed rule)
+MAX_ITERATIONS:   200
+CONVERGENCE_TOL:  0.0005
+MOVE_LIMIT:       0.3
+PENAL stage1:     2.0
+PENAL stage2:     3.0
+```
+
+### Bolt Seat Parameters
+```
+void_radius_m:         0.006  (6mm hole clearance)
+wall_radius_m:         0.009  (9mm entry/exit collar)
+seat_depth_m:          0.015  (15mm collar depth)
+through_ring_radius_m: 0.007  (7mm full-depth ring)
+```
+
+### Shell Enforcement Parameters (NB05)
+```
+SHELL_ENFORCE_FACES:  ["x_min", "x_max", "y_min", "y_max"]
+SHELL_THICKNESS_MM:   8.0
+```
+
+### Run Results
+```
+Iterations:     238 (converged)
+Final C:        0.03583 J
+Gray fraction:  <5% (PASS)
+Safety factor:  11.09 (PASS)
+Watertight:     true
+Open edges:     0
+```

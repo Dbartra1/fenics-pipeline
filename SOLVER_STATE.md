@@ -1372,3 +1372,205 @@ confirm HEAD, test count, and exact function signatures of files to be modified.
 5. After changes: `cargo build --release 2>&1 | grep "^error"` then
    `cargo test --release 2>&1 | tail -5`
 6. Only commit after green tests
+
+
+---
+
+## 14. Session Changes (2026-05-22 to 2026-05-24)
+
+### NB04 Diagnostic Layer Added
+
+Three new cells added to `notebooks/04_simp_optimization.ipynb`:
+
+**Cell 5b — Density quality diagnostics**
+- Computes gray element fraction against design mask (not total grid)
+- Classifies convergence shape: healthy_monotone / mostly_monotone /
+  oscillating / early_plateau / insufficient_data
+- Stores results in `_diag` dict for downstream cells
+- Runtime: <1s (pure numpy, no FEA)
+
+**Cell 5c — Orthogonal slice plots**
+- Generates XY, XZ, YZ mid-plane density slices unconditionally
+- Always runs regardless of RENDER_PLOTS setting
+- Saves to `outputs/reports/{part_name}_density_slices.png`
+- Uses correct array orientation: `density[iz, iy, ix]` with physical mm axes
+
+**Modified Cell 6 — Stage04 handoff**
+- Now writes `compliance_history` and `volume_history` to stage04.json
+  (previously stripped — downstream notebooks couldn't access them)
+- Appends `diagnostic` block to stage04.json
+- Writes standalone `outputs/reports/{part_name}_simp_diagnostic.json`
+- Prints formatted terminal summary at end of run
+
+### NB05 Shell Enforcement Added
+
+New Cell 2b added to `notebooks/05_stl_export.ipynb` between density load
+and marching cubes:
+
+```python
+SHELL_ENFORCE_FACES = ["x_min", "x_max", "y_min", "y_max"]
+SHELL_THICKNESS_MM  = 8.0
+```
+
+**Mechanism**: loads `outputs/problem/void.bin`, builds face slice map,
+forces outer voxels solid where `void_mask == False`. The modified density
+flows into the existing Cell 3 (marching cubes) unchanged.
+
+**Why this works without junction artifacts**: the shell modifies the
+density array before marching cubes — it is one continuous field, not two
+geometries being merged. The slab approach failed because it created
+separate geometry that had to be joined post-marching-cubes.
+
+**Confirmed SHELL_THICKNESS_MM values**:
+- 2mm: FAIL — Taubin smoothing erases thin shell between strut anchor points
+- 8mm: PASS — survives smoothing, leaves meaningful interior design space
+- 15mm: PASS but over-constrains — too much forced material
+
+### Through-Ring Passive Element
+
+**Problem solved**: bolt holes appeared as corner cutouts because the
+optimizer had no incentive to build material around the void cylinders
+in the interior (middle 40mm) of the part. Entry/exit collar geometry
+(seat_depth=15mm) only influenced the first and last 15mm.
+
+**Implementation**:
+
+`src/geometry/param_schema.py` — `BoltSeatRegion` dataclass:
+```python
+through_ring_radius_m: Optional[float] = None
+```
+
+`scripts/voxelize.py` — Phase 4 bolt seat loop, after collar logic:
+```python
+if hasattr(region, 'through_ring_radius_m') \
+        and region.through_ring_radius_m is not None:
+    ring_r2   = region.through_ring_radius_m ** 2
+    ring_mask = (r2 >= void_r2) & (r2 < ring_r2)
+    nondesign[ring_mask] = 1
+```
+
+No `axis_coord` constraint — applies full axis length.
+Backward compatible — None default means existing params.json unchanged.
+
+`scad/motor_mount_params.json` — both bolt_seat groups:
+```json
+"through_ring_radius_m": 0.007
+```
+
+**Volume budget**: 6.8% of grid at motor mount dimensions.
+Previous full-collar approach consumed 40% — optimizer produced 8 solid
+columns with minimal bridging.
+
+### Confirmed Working Parameters (motor_mount v3)
+
+```
+filter_radius:         3.0mm (changed from 6.0mm)
+through_ring_radius_m: 0.007 (new)
+SHELL_ENFORCE_FACES:   ["x_min","x_max","y_min","y_max"]
+SHELL_THICKNESS_MM:    8.0
+```
+
+Run results:
+```
+iterations:     238 (converged, stage1+stage2)
+final_C:        0.03583 J (best yet — 12.5% improvement over 6mm filter run)
+gray_fraction:  <5% PASS
+SF:             11.09 PASS
+watertight:     true
+open_edges:     0
+```
+
+### Updated Inter-Stage Handoff: stage04.json
+
+Schema additions (all new fields populated by modified Cell 6):
+
+```json
+{
+  ...existing fields...,
+  "compliance_history": [...],
+  "volume_history":     [...],
+  "diagnostic": {
+    "gray_fraction_all":    0.031,
+    "gray_fraction_design": 0.028,
+    "gray_status":          "PASS",
+    "solid_fraction":       0.381,
+    "void_fraction":        0.619,
+    "convergence_shape":    "mostly_monotone",
+    "convergence_note":     "...",
+    "final_spread":         8.3e-6,
+    "stage1_iters":         91,
+    "stage2_iters":         147,
+    "slice_plots_png":      "outputs/reports/motor_mount_density_slices.png"
+  }
+}
+```
+
+### Diagnostic Report: {part}_simp_diagnostic.json
+
+New file written to `outputs/reports/` by NB04 Cell 6. Contains:
+- Full compliance_history and volume_history arrays
+- Convergence block: shape, spread, reduction_pct, avg_iter_s
+- Density quality block: gray fractions, solid/void fractions, status
+- Volume constraint block: target, achieved, error_pct
+- Config block: all SIMP parameters used
+- Artifacts block: paths to all output files
+
+This is the file to share in a review session for quantitative evaluation.
+
+### Updated Python Pipeline Module Map: voxelize.py
+
+`BoltSeatRegion` now supports `through_ring_radius_m` (Optional[float]).
+When set, applies a thin forced-solid annulus around the void for the full
+axis length. When None (default), behaviour is identical to original.
+
+The through-ring ring_mask computation:
+```python
+ring_mask = (r2 >= void_r2) & (r2 < ring_r2)
+```
+Lower bound `r2 >= void_r2` ensures the void core is never overwritten.
+No axis constraint — full part depth is covered.
+
+### Updated Tech Debt
+
+**TD-08: Dimensional accuracy oversize from shell enforcement (NEW)**
+- Parts with SHELL_ENFORCEMENT active report ~2.7% oversize on all axes
+- Root cause: 8mm shell + marching cubes interpolation adds ~2-3mm per face
+- Impact: dimensional WARN in NB06 for every shell-enforced part
+- Fix options: (a) subtract SHELL_THICKNESS_MM/2 from marching cubes
+  spacing; (b) post-process STL to clip to bounding box; (c) accept and drill
+- Priority: LOW for prototyping, MEDIUM for production fitment
+
+**TD-09: Through-ring holes have organic edges (NEW)**
+- At 1mm ring thickness, the marching cubes surface at hole boundaries
+  is slightly irregular — not a perfect cylinder
+- Fix: increase through_ring_radius_m from 0.007 to 0.0075 or 0.008
+- Priority: LOW — holes are functional and usable for FDM prototyping
+
+### Architectural Decisions Added
+
+**AD-10: Shell enforcement must be void-aware**
+The shell enforcement in NB05 MUST load void.bin and check the void mask
+before forcing voxels solid. Failing to do so fills bolt holes. The
+void.bin path is `outputs/problem/void.bin` — regenerated every NB04 run.
+If void.bin is stale (from a different grid size), shell enforcement will
+silently produce incorrect hole geometry.
+
+**AD-11: Slab approach is permanently retired**
+Forced-solid rectangular slabs (via attachment_regions) have been attempted
+multiple times and always produce 900+ non-manifold faces at the junction
+between slab and optimizer topology. This is an architectural incompatibility
+with marching cubes, not a parameter tuning problem. Do not re-propose slabs.
+The confirmed replacement is shell enforcement (AD-12) + through-ring (AD-13).
+
+**AD-12: Shell enforcement is correct for connectivity**
+Shell enforcement operates on the density array before marching cubes — one
+continuous field. This is architecturally correct and produces zero junction
+artifacts. The shell thickness must be ≥ bolt_seat seat_depth_m to survive
+Taubin smoothing.
+
+**AD-13: Through-ring is correct for bolt hole geometry**
+Through-ring passive elements (1mm forced-solid annulus, full axis length)
+give the optimizer geometry to anchor around without consuming the volume
+budget. The confirmed ring thickness is 1mm (void_radius + 0.001m).
+Full-depth thick collars (the previously failed approach) must not be
+re-attempted — they consumed 40% of material budget.
