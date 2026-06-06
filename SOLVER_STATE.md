@@ -74,9 +74,9 @@ fenics-pipeline/
 │   ├── executed_nbs/                  ← Papermill output notebooks
 │   ├── meshes/                        ← XDMF, NPY, STL, stage JSON files
 │   ├── problem/                       ← Solver I/O (problem.json, binary files)
-│   │   ├── fixed_dofs.bin
-│   │   ├── load_dofs.bin
-│   │   ├── load_vals.bin
+│   │   ├── fixed_dofs.bin             ← shared supports (all load cases)
+│   │   ├── load_dofs_0.bin            ← per load case: load_dofs_{i}.bin
+│   │   ├── load_vals_0.bin            ← per load case: load_vals_{i}.bin
 │   │   ├── nondesign.bin
 │   │   ├── void.bin
 │   │   ├── problem_s1.json            ← Stage 1 problem spec
@@ -208,7 +208,8 @@ pub struct SimpConfig {
 pub struct Problem {
     pub grid: Grid,
     pub material: Material,
-    pub load_case: LoadCase,
+    pub fixed_dofs: Vec<usize>,     // SHARED Dirichlet supports (all load cases)
+    pub load_cases: Vec<LoadCase>,  // R1: one or more weighted load scenarios
     pub config: SimpConfig,
     pub nondesign: Vec<bool>,       // len = n_elem
     pub void_mask: Vec<bool>,       // len = n_elem
@@ -216,9 +217,13 @@ pub struct Problem {
 }
 
 pub struct LoadCase {
-    pub fixed_dofs: Vec<usize>,
+    pub name: String,                    // scenario label (diagnostics / logs)
+    pub weight: f64,                     // weight in the aggregated objective
     pub load_dofs: Vec<usize>,
     pub load_vals: Vec<f64>,
+    pub fixed_dofs: Option<Vec<usize>>,  // RESERVED: per-case supports (future
+                                         // phase). Must be None today — io.rs
+                                         // rejects a per-case fixed_dofs_file.
 }
 
 pub struct SolveResult {
@@ -235,6 +240,16 @@ pub struct SolveResult {
 ```
 
 `pub const RHO_MIN: f64 = 1e-3;`
+
+**Multi-load aggregation (R1)**: `Problem` carries a SHARED `fixed_dofs` plus a
+`Vec<LoadCase>`. All cases share the same supports, so the stiffness matrix K is
+assembled and preconditioned (AMGCL hierarchy) ONCE per SIMP iteration; then each
+case's RHS is solved and compliance/sensitivities are accumulated as a weighted
+sum, C = Σ_i wᵢ·Cᵢ (sensitivities likewise — filtering is linear, so filtering the
+summed dc equals summing filtered dc). Single-load is the k=1 special case and is
+bit-for-bit the old single-load solve (validated: motor_mount reproduced its
+0.03583 baseline through the k=1 path). Per-case supports (`LoadCase.fixed_dofs`)
+are reserved for a future phase; today every case shares `Problem.fixed_dofs`.
 
 ---
 
@@ -794,7 +809,8 @@ NB03: FEniCSx FEA (validation / displacement field)
          ▼
 NB04: SIMP Optimization (primary — Rust voxel path)
   Cell 2: voxelize_domain() → void_mask, nondesign (nz×ny×nx bool arrays)
-  Cell 2: build_load_case() → fixed_dofs.bin, load_dofs.bin, load_vals.bin
+  Cell 2: build_load_case() → fixed_dofs.bin (shared) + per-case
+          load_dofs_{i}.bin / load_vals_{i}.bin (one pair per load case)
   Cell 3: write nondesign.bin, void.bin
   Cell 3: write problem_s1.json, run bin/simp_solver → density.bin, result.json
   Cell 3: write problem_s2.json (warm-start), run bin/simp_solver again
@@ -829,9 +845,9 @@ NB06: Part Validation
 
 | File                | Format         | Shape           | dtype   | Written by  | Read by     |
 |---------------------|----------------|-----------------|---------|-------------|-------------|
-| fixed_dofs.bin      | raw flat array | (n_fixed,)      | int64   | NB04 Cell 3 | Rust solver |
-| load_dofs.bin       | raw flat array | (n_load,)       | int64   | NB04 Cell 3 | Rust solver |
-| load_vals.bin       | raw flat array | (n_load,)       | float64 | NB04 Cell 3 | Rust solver |
+| fixed_dofs.bin      | raw flat array | (n_fixed,)      | uint32  | NB04 Cell 3 | Rust solver |
+| load_dofs_{i}.bin   | raw flat array | (n_load_i,)     | uint32  | NB04 Cell 3 | Rust solver |
+| load_vals_{i}.bin   | raw flat array | (n_load_i,)     | float64 | NB04 Cell 3 | Rust solver |
 | nondesign.bin       | raw flat array | (n_elem,)       | uint8   | NB04 Cell 3 | Rust solver |
 | void.bin            | raw flat array | (n_elem,)       | uint8   | NB04 Cell 3 | Rust solver |
 | x_init.bin          | raw flat array | (n_elem,)       | float32 | NB04 Cell 3 | Rust solver |
@@ -840,6 +856,34 @@ NB06: Part Validation
 
 Note: n_elem = nx × ny × nz (X-fastest layout). When reading density.bin
 in Python: reshape to (nz, ny, nx) before any slicing.
+
+Note: DOF index arrays are uint32 little-endian (io.rs reads them with
+read_u32_le; the Python writer emits np.uint32). load_vals are float64.
+
+### problem_sN.json — "loading" Block (R1 multi-load schema)
+
+The solver reads its load problem from the `loading` block of problem_sN.json.
+Supports are shared; each load case names its own DOF/value files:
+
+```json
+"loading": {
+  "fixed_dofs_file": "fixed_dofs.bin",
+  "load_cases": [
+    { "name": "thrust_down", "weight": 1.0,
+      "load_dofs_file": "load_dofs_0.bin", "load_vals_file": "load_vals_0.bin" },
+    { "name": "side_y", "weight": 1.0,
+      "load_dofs_file": "load_dofs_1.bin", "load_vals_file": "load_vals_1.bin" }
+  ]
+}
+```
+
+- `name` (default "lc{i}") and `weight` (default 1.0) are optional per case.
+- `load_cases` must be non-empty (io.rs rejects an empty list).
+- A per-case `fixed_dofs_file` key is RESERVED — io.rs errors if present
+  (per-case supports are a future phase; today all cases share fixed_dofs_file).
+- This REPLACED the pre-R1 `load_case` block ({fixed_dofs_file, load_dofs_file,
+  load_vals_file}). problem_sN.json is ephemeral (gitignored), so this was a
+  clean break, not a back-compat addition.
 
 
 ---
@@ -860,7 +904,12 @@ and load/boundary condition arrays for the Rust solver.
 
 `build_load_case(geometry_params, load_hints, grid_config,
                  load_case_config=None, attachment_regions=None) → dict`
-- Returns {'fixed_dofs': np.array, 'load_dofs': np.array, 'load_vals': np.array}
+- Returns {'fixed_dofs': np.array (shared),
+           'load_cases': [{'name','weight','load_dofs','load_vals'}, ...],
+           'load_dofs', 'load_vals'}   ← top-level 'load_dofs'/'load_vals' are a
+  back-compat alias for load_cases[0] (the primary case)
+- Builds one load_cases entry per scenario in load_case_config.loads; a legacy
+  single 'load' (or the non-config path) yields one case named "primary"
 - Dispatches to appropriate selector based on load_case_config
 
 `_fixed_dofs_from_config(geometry_params, grid_config, load_case_config,
