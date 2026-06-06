@@ -61,10 +61,16 @@ def _write_minimal_problem(d: Path, nx=10, ny=6, nz=4) -> dict:
             "damping": 0.5,
             "checkpoint_every": 0,
         },
-        "load_case": {
+        "loading": {
             "fixed_dofs_file": "fixed_dofs.bin",
-            "load_dofs_file":  "load_dofs.bin",
-            "load_vals_file":  "load_vals.bin",
+            "load_cases": [
+                {
+                    "name":           "primary",
+                    "weight":         1.0,
+                    "load_dofs_file": "load_dofs.bin",
+                    "load_vals_file": "load_vals.bin",
+                },
+            ],
         },
         "nondesign_file": "nondesign.bin",
         "void_file":      "void.bin",
