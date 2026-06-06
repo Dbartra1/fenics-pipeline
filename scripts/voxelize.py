@@ -263,16 +263,30 @@ def build_load_case(
     attachment_regions=None,   # list[AttachmentRegion] or None (Phase 5)
 ) -> dict:
     """
-    Returns {"fixed_dofs": u32, "load_dofs": u32, "load_vals": f64}.
+    Returns a dict describing the load problem with SHARED supports:
 
-    If load_case_config is provided (Phase 2), uses declarative face selection.
-    Otherwise falls back to legacy top-load / corner-fix behavior.
+        {
+            "fixed_dofs": u32,                       # shared across all cases
+            "load_cases": [                          # one entry per scenario
+                {"name": str, "weight": float,
+                 "load_dofs": u32, "load_vals": f64},
+                ...
+            ],
+            "load_dofs":  u32,   # back-compat: == load_cases[0]["load_dofs"]
+            "load_vals":  f64,   # back-compat: == load_cases[0]["load_vals"]
+        }
+
+    Multi-load (R1): load_case_config.loads holds one or more LoadFaceConfig
+    scenarios that SHARE the fixed supports; each becomes a load_cases entry.
+    A legacy single "load" (or the non-config path) yields one case named
+    "primary". Per-case supports are a future extension (see param_schema).
+
+    If load_case_config is provided, uses declarative face selection;
+    otherwise falls back to legacy top-load / corner-fix behaviour.
 
     Phase 5: if attachment_regions are provided, their fixed DOFs are merged
-    (union) with any DOFs from load_case_config.fixed.  When
-    load_case_config.fixed is None, attachment_regions are the sole source
-    of fixity — this is the correct configuration for the motor mount and
-    any part where the attachment slab owns the wall BC.
+    (union) with any DOFs from load_case_config.fixed.  When fixed is None,
+    attachment_regions are the sole source of fixity.
     """
     nx = grid_config["nx"]
     ny = grid_config["ny"]
@@ -304,9 +318,16 @@ def build_load_case(
             "bc != 'none'. An empty fixed set makes the stiffness matrix singular."
         )
 
-        load_dofs, load_vals = _load_dofs_from_config(
-            load_case_config.load, geometry_params, nx, ny, nz, h
-        )
+        # One entry per load scenario; supports (fixed_dofs above) are shared.
+        load_cases = []
+        for i, lc_face in enumerate(load_case_config.loads):
+            ld, lv = _load_dofs_from_config(lc_face, geometry_params, nx, ny, nz, h)
+            load_cases.append({
+                "name":      lc_face.name or f"lc{i}",
+                "weight":    float(lc_face.weight),
+                "load_dofs": ld,
+                "load_vals": lv,
+            })
 
     else:
         # ── Legacy: top-load, corner-fix ─────────────────────────────────
@@ -348,11 +369,18 @@ def build_load_case(
             [3 * n + d for n in fixed_nodes for d in range(3)],
             dtype=np.uint32,
         )
+        load_cases = [{
+            "name": "primary", "weight": 1.0,
+            "load_dofs": load_dofs, "load_vals": load_vals,
+        }]
 
     return {
         "fixed_dofs": fixed_dofs,
-        "load_dofs":  load_dofs,
-        "load_vals":  load_vals,
+        "load_cases": load_cases,
+        # Back-compat: expose the primary (first) case at top level so callers
+        # and tests that read result["load_dofs"]/["load_vals"] keep working.
+        "load_dofs":  load_cases[0]["load_dofs"],
+        "load_vals":  load_cases[0]["load_vals"],
     }
 
 

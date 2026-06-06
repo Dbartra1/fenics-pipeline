@@ -183,6 +183,12 @@ class LoadFaceConfig:
     disk_radius_m:  float          = 0.010
     # bolt_pattern selector only: list of [a, b] in-plane center coords in metres.
     bolt_centers_m: Optional[List] = None
+    # Multi-load (R1): scenario identity + relative importance in the aggregated
+    # objective. `name` is used in diagnostics; `weight` feeds the weighted-sum
+    # (and, later, the worst-case p-norm). Defaults make a single unnamed load
+    # behave exactly as before.
+    name:           str            = ""
+    weight:         float          = 1.0
 
     VALID_FACES     = {"x_min", "x_max", "y_min", "y_max", "z_min", "z_max"}
     VALID_SELECTORS = {"full", "center_disk", "bolt_pattern"}
@@ -195,6 +201,7 @@ class LoadFaceConfig:
         assert len(self.direction) == 3, "direction must be [x, y, z]"
         assert self.magnitude_n > 0, "magnitude_n must be > 0"
         assert self.disk_radius_m > 0, "disk_radius_m must be > 0"
+        assert self.weight >= 0, f"load weight must be >= 0, got {self.weight}"
         if self.selector == "bolt_pattern":
             assert self.bolt_centers_m is not None and len(self.bolt_centers_m) > 0, (
                 "bolt_pattern selector requires bolt_centers_m "
@@ -208,24 +215,45 @@ class LoadFaceConfig:
 @dataclass
 class LoadCaseConfig:
     """
-    Full load case: fixed BCs + applied load.
-    Replaces the hardcoded logic in build_load_case().
+    One or more load scenarios that SHARE a set of fixed supports.
 
-    Phase 5 note: fixed is now Optional.  When None, the fixed BCs are
-    derived entirely from attachment_regions in voxelize.build_load_case().
-    Omit the "fixed" key from the load_case JSON block to trigger this path
-    (the motor mount uses it — the attachment slab owns fixity).
+    fixed  — shared Dirichlet supports (Optional). When None, fixity is derived
+             from attachment_regions in voxelize.build_load_case() (the motor
+             mount uses this — the attachment slab owns fixity).
+    load   — back-compat single-scenario field. A params block with a single
+             "load": {...} sets this; `loads` is then [load].
+    loads  — full list of scenarios (R1 multi-load). A params block with
+             "loads": [ {...}, {...} ] sets this; `load` mirrors loads[0] for
+             back-compat accessors. Supports are shared across all of them.
+
+    Per-case supports (a different `fixed` per scenario) are a future extension;
+    today every scenario shares `fixed`.
     """
-    fixed: Optional[FixedFaceConfig] = None
-    load:  LoadFaceConfig            = field(default_factory=LoadFaceConfig)
+    fixed: Optional[FixedFaceConfig]      = None
+    load:  LoadFaceConfig                 = field(default_factory=LoadFaceConfig)
+    loads: Optional[List[LoadFaceConfig]] = None
+
+    def __post_init__(self) -> None:
+        # Normalise to a non-empty list. `load` (singular) and `loads` (list)
+        # are kept in sync: whichever was supplied drives the other.
+        if self.loads is None:
+            self.loads = [self.load]
+        else:
+            assert len(self.loads) >= 1, "loads must be non-empty"
+            self.load = self.loads[0]
 
     def validate(self) -> None:
         if self.fixed is not None:
             self.fixed.validate()
-        self.load.validate()
-        if self.fixed is not None:
-            assert self.fixed.face != self.load.face, \
-                "fixed face and load face cannot be the same"
+        seen = set()
+        for i, ld in enumerate(self.loads):
+            ld.validate()
+            if self.fixed is not None:
+                assert self.fixed.face != ld.face, \
+                    f"fixed face and load face cannot be the same (load '{ld.name or i}')"
+            nm = ld.name or f"lc{i}"
+            assert nm not in seen, f"duplicate load case name '{nm}'"
+            seen.add(nm)
 
 
 @dataclass
@@ -622,11 +650,23 @@ class PipelineParams:
         load_case_config = None
         if lc_raw is not None:
             fixed_raw = lc_raw.get("fixed", None)
-            load_raw  = lc_raw.get("load", {})
-            load_case_config = LoadCaseConfig(
-                fixed=FixedFaceConfig(**fixed_raw) if fixed_raw else None,
-                load=LoadFaceConfig(**load_raw)    if load_raw  else LoadFaceConfig(),
-            )
+            fixed_cfg = FixedFaceConfig(**fixed_raw) if fixed_raw else None
+
+            def _mk_load(d):
+                return LoadFaceConfig(**{k: v for k, v in d.items()
+                                         if not k.startswith("_")})
+
+            loads_raw = lc_raw.get("loads", None)   # R1 multi-load (list)
+            load_raw  = lc_raw.get("load",  None)   # legacy single
+            if loads_raw is not None:
+                load_case_config = LoadCaseConfig(
+                    fixed=fixed_cfg,
+                    loads=[_mk_load(d) for d in loads_raw],
+                )
+            elif load_raw is not None:
+                load_case_config = LoadCaseConfig(fixed=fixed_cfg, load=_mk_load(load_raw))
+            else:
+                load_case_config = LoadCaseConfig(fixed=fixed_cfg)
 
         # Parse nondesign_regions if present
         nd_raw = raw.get("nondesign_regions", [])
