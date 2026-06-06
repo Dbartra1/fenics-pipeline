@@ -24,7 +24,7 @@ struct ProblemJson {
     grid:           GridJson,
     material:       MaterialJson,
     config:         ConfigJson,
-    load_case:      LoadCaseJson,
+    loading:        LoadingJson,
     nondesign_file: String,
     void_file:      String,
     x_init_file:    Option<String>,
@@ -67,11 +67,26 @@ struct ConfigJson {
     max_cg_iter:           usize,
 }
 
+fn default_weight() -> f64 { 1.0 }
+
 #[derive(Deserialize)]
-struct LoadCaseJson {
+struct LoadingJson {
+    /// Shared supports across all load cases.
     fixed_dofs_file: String,
+    load_cases:      Vec<LoadCaseEntryJson>,
+}
+
+#[derive(Deserialize)]
+struct LoadCaseEntryJson {
+    #[serde(default)]
+    name:            String,
+    #[serde(default = "default_weight")]
+    weight:          f64,
     load_dofs_file:  String,
     load_vals_file:  String,
+    /// RESERVED — per-case supports (wishlist). Absent on the shared path.
+    #[serde(default)]
+    fixed_dofs_file: Option<String>,
 }
 
 // ─── Binary readers ───────────────────────────────────────────────────────────
@@ -163,16 +178,29 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
     };
     let n_elem = grid.n_elem();
 
-    let fixed_dofs_u32 = read_u32_le(&p(&pj.load_case.fixed_dofs_file))?;
-    let load_dofs_u32  = read_u32_le(&p(&pj.load_case.load_dofs_file))?;
-    let load_vals      = read_f64_le(&p(&pj.load_case.load_vals_file))?;
+    let fixed_dofs: Vec<usize> = read_u32_le(&p(&pj.loading.fixed_dofs_file))?
+        .iter().map(|&x| x as usize).collect();
 
-    let load_case = LoadCase {
-        fixed_dofs: fixed_dofs_u32.iter().map(|&x| x as usize).collect(),
-        load_dofs:  load_dofs_u32.iter().map(|&x| x as usize).collect(),
-        load_vals,
-    };
-    load_case.validate()?;
+    let mut load_cases: Vec<LoadCase> = Vec::with_capacity(pj.loading.load_cases.len());
+    for (i, lc) in pj.loading.load_cases.iter().enumerate() {
+        // Per-case supports are reserved; reject if a file is provided (Phase 1).
+        if lc.fixed_dofs_file.is_some() {
+            return Err(format!(
+                "load case {i}: per-case fixed_dofs_file is reserved and not yet \
+                 supported (shared supports only)"
+            ));
+        }
+        let load_dofs: Vec<usize> = read_u32_le(&p(&lc.load_dofs_file))?
+            .iter().map(|&x| x as usize).collect();
+        let load_vals = read_f64_le(&p(&lc.load_vals_file))?;
+        let name = if lc.name.is_empty() { format!("lc{i}") } else { lc.name.clone() };
+        let case = LoadCase { name, weight: lc.weight, load_dofs, load_vals, fixed_dofs: None };
+        case.validate()?;
+        load_cases.push(case);
+    }
+    if load_cases.is_empty() {
+        return Err("loading.load_cases must contain at least one load case".to_string());
+    }
 
     let nondesign_u8 = read_u8(&p(&pj.nondesign_file))?;
     let void_u8      = read_u8(&p(&pj.void_file))?;
@@ -200,7 +228,8 @@ pub fn load_problem(json_path: &Path) -> Result<Problem, String> {
     let problem = Problem {
         grid,
         material: Material { young: pj.material.young, poisson: pj.material.poisson },
-        load_case,
+        fixed_dofs,
+        load_cases,
         config: SimpConfig {
             use_gpu:               pj.config.use_gpu,
             volume_fraction:       pj.config.volume_fraction,

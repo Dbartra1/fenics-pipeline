@@ -60,11 +60,16 @@ pub fn run_simp(problem: &Problem, out_dir: &Path) -> SolveResult {
     let void_mask = &problem.void_mask;
     let nondesign = &problem.nondesign;
 
-    let mut f = vec![0.0f64; n_dof];
-    for (&dof, &val) in problem.load_case.load_dofs.iter()
-                                                    .zip(problem.load_case.load_vals.iter()) {
-        if dof < n_dof { f[dof] += val; }
-    }
+    // One RHS vector per load case (loads are constant across SIMP iterations;
+    // only the density / K changes between iterations).
+    let n_lc = problem.load_cases.len();
+    let f_per_case: Vec<Vec<f64>> = problem.load_cases.iter().map(|lc| {
+        let mut f = vec![0.0f64; n_dof];
+        for (&dof, &val) in lc.load_dofs.iter().zip(lc.load_vals.iter()) {
+            if dof < n_dof { f[dof] += val; }
+        }
+        f
+    }).collect();
 
     // ── Resume or fresh start ─────────────────────────────────────────────────
     //
@@ -109,7 +114,8 @@ pub fn run_simp(problem: &Problem, out_dir: &Path) -> SolveResult {
     let mut converged    = false;
     let mut n_iterations = iter_start;
 
-    let mut u = vec![0.0f64; n_dof];
+    // One warm-start displacement vector per load case, persisted across iterations.
+    let mut us: Vec<Vec<f64>> = vec![vec![0.0f64; n_dof]; n_lc];
 
     // ── Solver backend ────────────────────────────────────────────────────────
     let mut gpu_ctx = GpuContext::new(cfg.use_gpu);
@@ -135,24 +141,45 @@ pub fn run_simp(problem: &Problem, out_dir: &Path) -> SolveResult {
 
         let mut k_bc = k_vals;
         apply_dirichlet(&mut k_bc, &pattern.k_rows, &pattern.k_cols,
-                        &problem.load_case.fixed_dofs, diag_mean);
+                        &problem.fixed_dofs, diag_mean);
 
-        let mut f_bc = f.clone();
-        for &d in &problem.load_case.fixed_dofs { f_bc[d] = 0.0; }
+        // ── Solve every load case against the shared, BC-applied K, then
+        //    aggregate (Phase 1: weighted sum of compliances/sensitivities).
+        //    K is assembled and preconditioned once per iteration; each load
+        //    case is a separate RHS with its own warm-started u in `us`.
+        //    Filtering is linear in dc with x shared across cases, so summing
+        //    filtered per-case sensitivities equals filtering the summed raw.
+        let mut compliance     = 0.0f64;
+        let mut dc             = vec![0.0f64; n_elem];
+        let mut cg_iters_total = 0usize;
+        let mut worst_residual = 0.0f64;
+        let mut all_converged  = true;
 
-        let solve = solve_linear_system(
-            &pattern.k_rows, &pattern.k_cols, &k_bc,
-            &f_bc, &mut u,
-            1e-6,
-            cfg.max_cg_iter,
-            grid.nx + 1, grid.ny + 1, grid.nz + 1,
-            &mut gpu_ctx,
-        );
+        for (lc_i, lc) in problem.load_cases.iter().enumerate() {
+            let mut f_bc = f_per_case[lc_i].clone();
+            for &d in &problem.fixed_dofs { f_bc[d] = 0.0; }
 
-        let compliance = compute_compliance(&x, &u, &ke, &dof_map, cfg.penal,
-                                            void_mask, nondesign);
-        let dc = compute_sensitivities(&x, &u, &ke, &dof_map, &fw, cfg.penal,
-                                       void_mask, nondesign);
+            let solve = solve_linear_system(
+                &pattern.k_rows, &pattern.k_cols, &k_bc,
+                &f_bc, &mut us[lc_i],
+                1e-6,
+                cfg.max_cg_iter,
+                grid.nx + 1, grid.ny + 1, grid.nz + 1,
+                &mut gpu_ctx,
+            );
+
+            let c_i  = compute_compliance(&x, &us[lc_i], &ke, &dof_map, cfg.penal,
+                                          void_mask, nondesign);
+            let dc_i = compute_sensitivities(&x, &us[lc_i], &ke, &dof_map, &fw, cfg.penal,
+                                             void_mask, nondesign);
+
+            compliance += lc.weight * c_i;
+            for (acc, &v) in dc.iter_mut().zip(dc_i.iter()) { *acc += lc.weight * v; }
+
+            cg_iters_total += solve.iterations;
+            if solve.rel_residual > worst_residual { worst_residual = solve.rel_residual; }
+            if !solve.converged { all_converged = false; }
+        }
 
         let oc        = oc_update(&x, &dc, cfg, void_mask, nondesign);
         let rho_change = oc.rho_change;
@@ -163,10 +190,10 @@ pub fn run_simp(problem: &Problem, out_dir: &Path) -> SolveResult {
         volume_history.push(vol_frac);
 
         println!(
-            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | CG={:4} | res={:.1e} | {:.1}s{}",
+            "Iter {:4} | C={:.4e} | Vol={:.3} | Δρ={:.4e} | p={} | LC={} | CG={:4} | res={:.1e} | {:.1}s{}",
             n_iterations, compliance, vol_frac, rho_change, cfg.penal,
-            solve.iterations, solve.rel_residual, elapsed,
-            if solve.converged { "" } else { " [SOLVE!]" }
+            n_lc, cg_iters_total, worst_residual, elapsed,
+            if all_converged { "" } else { " [SOLVE!]" }
         );
 
         // ── Checkpoint write ──────────────────────────────────────────────────
@@ -286,7 +313,14 @@ mod tests {
         Problem {
             grid: g,
             material: Material { young: 210e9, poisson: 0.3 },
-            load_case: LoadCase { fixed_dofs, load_dofs, load_vals },
+            fixed_dofs,
+            load_cases: vec![LoadCase {
+                name: "test".to_string(),
+                weight: 1.0,
+                load_dofs,
+                load_vals,
+                fixed_dofs: None,
+            }],
             config: SimpConfig {
                 use_gpu:               false,
                 volume_fraction:       0.5,
@@ -331,6 +365,39 @@ mod tests {
         for (i, &vf) in result.volume_history.iter().enumerate() {
             assert!((vf - target).abs() < 0.05,
                 "iter {}: vol_frac={:.4} too far from target={:.4}", i+1, vf, target);
+        }
+    }
+
+    #[test]
+    fn two_identical_halfweight_loads_match_single() {
+        // Aggregation invariant: one load case at weight 1.0 must produce exactly
+        // the same optimisation as two identical load cases at weight 0.5 each
+        // (0.5*C + 0.5*C == C; 0.5*dc + 0.5*dc == dc). Also guards the k=1
+        // single-load path against regression from the multi-load refactor.
+        let single = make_problem(4, 3, 2);
+        let r1 = run_simp(&single, Path::new("/tmp"));
+
+        let mut dual = make_problem(4, 3, 2);
+        let ld = dual.load_cases[0].load_dofs.clone();
+        let lv = dual.load_cases[0].load_vals.clone();
+        dual.load_cases[0].weight = 0.5;
+        dual.load_cases.push(LoadCase {
+            name: "dup".to_string(),
+            weight: 0.5,
+            load_dofs: ld,
+            load_vals: lv,
+            fixed_dofs: None,
+        });
+        let r2 = run_simp(&dual, Path::new("/tmp"));
+
+        assert_eq!(r1.compliance_history.len(), r2.compliance_history.len());
+        let c1 = *r1.compliance_history.last().unwrap();
+        let c2 = *r2.compliance_history.last().unwrap();
+        assert!((c1 - c2).abs() <= 1e-9 * c1.abs().max(1e-30),
+            "two half-weight loads diverged from single: {c1} vs {c2}");
+        assert_eq!(r1.final_density.len(), r2.final_density.len());
+        for (a, b) in r1.final_density.iter().zip(r2.final_density.iter()) {
+            assert!((a - b).abs() <= 1e-9, "final density diverged: {a} vs {b}");
         }
     }
 

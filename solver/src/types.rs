@@ -133,14 +133,28 @@ impl Material {
 
 /// Boundary conditions for one load case.
 ///
+/// A single load case (one forcing scenario).
+///
 /// All indices are *global* DOF indices: DOF = 3*node + axis (0=x, 1=y, 2=z).
-/// `fixed_dofs` are clamped to zero displacement (Dirichlet BCs).
 /// `load_dofs`/`load_vals` are paired — load_vals[i] Newtons at load_dofs[i].
+///
+/// Supports (Dirichlet BCs) are SHARED across all load cases and live on
+/// `Problem.fixed_dofs`, so K is assembled and preconditioned once per SIMP
+/// iteration and reused across every load case.
+///
+/// `name`       — human-readable scenario label, used in diagnostics.
+/// `weight`     — relative importance in the aggregated objective (default 1.0).
+/// `fixed_dofs` — RESERVED for per-case supports (wishlist). `None` on the
+///                current shared-supports path; not populated yet. When made
+///                `Some`, it overrides `Problem.fixed_dofs` for this case and
+///                routes it through a per-case-K path (K no longer shared).
 #[derive(Debug)]
 pub struct LoadCase {
-    pub fixed_dofs: Vec<usize>,
+    pub name: String,
+    pub weight: f64,
     pub load_dofs: Vec<usize>,
     pub load_vals: Vec<f64>,
+    pub fixed_dofs: Option<Vec<usize>>,
 }
 
 impl LoadCase {
@@ -149,9 +163,14 @@ impl LoadCase {
     pub fn validate(&self) -> Result<(), String> {
         if self.load_dofs.len() != self.load_vals.len() {
             return Err(format!(
-                "load_dofs length {} != load_vals length {}",
-                self.load_dofs.len(),
-                self.load_vals.len()
+                "load case '{}': load_dofs length {} != load_vals length {}",
+                self.name, self.load_dofs.len(), self.load_vals.len()
+            ));
+        }
+        if !(self.weight.is_finite() && self.weight >= 0.0) {
+            return Err(format!(
+                "load case '{}': weight {} must be finite and >= 0",
+                self.name, self.weight
             ));
         }
         Ok(())
@@ -277,12 +296,16 @@ impl SimpConfig {
 /// `nondesign[e]` — element is forced solid regardless of optimization.
 /// `void_mask[e]` — element is always void; not assembled into K.
 ///  void takes priority over nondesign when both are true.
+/// `fixed_dofs`   — SHARED supports (Dirichlet BCs) across all load cases.
+/// `load_cases`   — one or more forcing scenarios (k >= 1); the objective is an
+///                  aggregate over them (Phase 1: weighted sum of compliances).
 /// `x_init`       — optional warm-start density field; None → uniform vf.
 #[derive(Debug)]
 pub struct Problem {
     pub grid: Grid,
     pub material: Material,
-    pub load_case: LoadCase,
+    pub fixed_dofs: Vec<usize>,
+    pub load_cases: Vec<LoadCase>,
     pub config: SimpConfig,
     pub nondesign: Vec<bool>,
     pub void_mask: Vec<bool>,
@@ -293,7 +316,19 @@ impl Problem {
     /// Validate all sub-fields and check mask lengths match n_elem.
     pub fn validate(&self) -> Result<(), String> {
         self.config.validate()?;
-        self.load_case.validate()?;
+        if self.load_cases.is_empty() {
+            return Err("problem must have at least one load case".to_string());
+        }
+        for lc in &self.load_cases {
+            lc.validate()?;
+            // Phase 1: shared supports only. Per-case supports are reserved.
+            if lc.fixed_dofs.is_some() {
+                return Err(format!(
+                    "load case '{}': per-case fixed_dofs is reserved and not yet \
+                     supported (shared supports only)", lc.name
+                ));
+            }
+        }
 
         let n = self.grid.n_elem();
         if self.nondesign.len() != n {
@@ -538,9 +573,11 @@ mod tests {
     #[test]
     fn loadcase_validate_ok_when_lengths_match() {
         let lc = LoadCase {
-            fixed_dofs: vec![0, 3, 6],
+            name: "test".to_string(),
+            weight: 1.0,
             load_dofs: vec![100, 101],
             load_vals: vec![-5000.0, -5000.0],
+            fixed_dofs: None,
         };
         assert!(lc.validate().is_ok());
     }
@@ -548,9 +585,11 @@ mod tests {
     #[test]
     fn loadcase_validate_err_on_length_mismatch() {
         let lc = LoadCase {
-            fixed_dofs: vec![0],
+            name: "test".to_string(),
+            weight: 1.0,
             load_dofs: vec![100, 101],
             load_vals: vec![-5000.0],    // length mismatch
+            fixed_dofs: None,
         };
         assert!(lc.validate().is_err());
     }
@@ -558,9 +597,11 @@ mod tests {
     #[test]
     fn loadcase_total_force() {
         let lc = LoadCase {
-            fixed_dofs: vec![],
+            name: "test".to_string(),
+            weight: 1.0,
             load_dofs: vec![0, 1, 2],
             load_vals: vec![-3000.0, -3000.0, -4000.0],
+            fixed_dofs: None,
         };
         assert!((lc.total_force() - 10000.0).abs() < 1e-9);
     }
@@ -621,11 +662,14 @@ mod tests {
         let p = Problem {
             grid: g,
             material: steel(),
-            load_case: LoadCase {
-                fixed_dofs: vec![0, 1, 2],
+            fixed_dofs: vec![0, 1, 2],
+            load_cases: vec![LoadCase {
+                name: "test".to_string(),
+                weight: 1.0,
                 load_dofs: vec![1000],
                 load_vals: vec![-10000.0],
-            },
+                fixed_dofs: None,
+            }],
             config: default_config(),
             nondesign: vec![false; n],
             void_mask: vec![false; n],
@@ -641,11 +685,14 @@ mod tests {
         let p = Problem {
             grid: g,
             material: steel(),
-            load_case: LoadCase {
-                fixed_dofs: vec![0],
+            fixed_dofs: vec![0],
+            load_cases: vec![LoadCase {
+                name: "test".to_string(),
+                weight: 1.0,
                 load_dofs: vec![100],
                 load_vals: vec![-1.0],
-            },
+                fixed_dofs: None,
+            }],
             config: default_config(),
             nondesign: vec![false; n + 1],   // wrong length
             void_mask: vec![false; n],
@@ -663,11 +710,14 @@ mod tests {
         let p = Problem {
             grid: g,
             material: steel(),
-            load_case: LoadCase {
-                fixed_dofs: vec![0],
+            fixed_dofs: vec![0],
+            load_cases: vec![LoadCase {
+                name: "test".to_string(),
+                weight: 1.0,
                 load_dofs: vec![100],
                 load_vals: vec![-1.0],
-            },
+                fixed_dofs: None,
+            }],
             config: default_config(),
             nondesign: vec![false; n],
             void_mask: vec![false; n],
