@@ -51,7 +51,7 @@ impl AmgclContext {
     #[inline] pub fn is_failed(&self) -> bool { self.failed }
 
     pub fn backend_label(&self) -> &'static str {
-        "AMGCL AMG-PCG (OpenMP, smoothed aggregation block_size=3 + SPAI0)"
+        "AMGCL AMG-PCG (OpenMP, smoothed aggregation block_size=3 + ILU(0))"
     }
 
     pub fn solve(

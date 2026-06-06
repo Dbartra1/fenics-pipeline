@@ -821,6 +821,17 @@ disk-geometry parts (from conrod and motor_mount experience). Parts with
 fewer fixed DOFs showed CG non-convergence and required either expanding the
 fixed region or reducing the load.
 
+NOTE (ring-geometry era): The >=19,000 figure is a SLAB-ERA / Jacobi-PCG-era
+artifact. It came from configurations where a rectangular attachment slab
+owned the wall BC and contributed most of the fixity. With slabs retired in
+favour of through-ring bolt seats, motor_mount fixity now comes from the
+`fixed` corner disks (~3,000 DOFs) and converges cleanly: the AMGCL
+smoothed-aggregation preconditioner (now the production solver) is far more
+robust to light fixity than the old Jacobi-PCG path this threshold was
+measured on. Four corner disks still constrain all six rigid-body modes, so
+the BC is valid. Treat >=19k as a Jacobi-PCG heuristic, NOT a hard AMGCL
+requirement; the real test is whether CG converges below max_cg_iter.
+
 Why DOF count matters: Rigid body modes in 3D have 6 degrees of freedom
 (3 translation, 3 rotation). Each rigid body mode represents a direction in
 which the structure can move without deforming. If K is not constrained

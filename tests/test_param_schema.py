@@ -256,22 +256,48 @@ class TestLiveJSONCompat:
         assert len(p.load_case_config.load.bolt_centers_m) == 4, \
             "motor_mount should have 4 NEMA bolt centers"
 
-    def test_motor_mount_has_two_attachment_regions(self):
-        """Session 6: motor mount must have both wall and motor face slabs."""
-        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
-        p = PipelineParams.from_dict(raw)
-        assert len(p.attachment_regions) == 2, (
-            "motor_mount should have 2 attachment_regions "
-            "(wall slab x_min and motor face slab x_max)"
-        )
+    def test_motor_mount_uses_ring_not_slab(self):
+        """Motor mount uses through-ring bolt seats, NOT attachment slabs.
 
-    def test_motor_mount_entry_seat_true(self):
-        """Session 6: bolt_seat entry_seat must be True after Bug P3 fix."""
+        Rectangular attachment slabs were abandoned (non-manifold geometry at
+        marching-cubes junctions). The motor mount must therefore declare ZERO
+        attachment_regions; fixity comes from bolt-seat collars + the `fixed`
+        corner disks. Each bolt seat carries a through_ring_radius_m — the ring
+        that replaced the slab. Do NOT reintroduce attachment slabs to make a
+        test pass.
+        """
         raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
         p = PipelineParams.from_dict(raw)
+        assert len(p.attachment_regions) == 0, (
+            "motor_mount must have NO attachment_regions — slabs were retired in "
+            "favour of through-ring bolt seats."
+        )
+        assert len(p.bolt_seats) >= 1, "motor_mount should declare bolt_seats"
         for bs in p.bolt_seats:
-            assert bs.entry_seat is True, \
-                f"bolt_seat entry_seat should be True, got {bs.entry_seat}"
+            assert bs.through_ring_radius_m and bs.through_ring_radius_m > 0, (
+                f"bolt_seat {bs.type} must set through_ring_radius_m (the ring "
+                f"mechanism that replaced the slab), got {bs.through_ring_radius_m}"
+            )
+
+    def test_motor_mount_bolt_seats_cover_both_faces(self):
+        """Bolt holes appear on BOTH faces via a matched seat pair.
+
+        The both-faces hole comes from a complementary pair of bolt seats (one
+        entry-side collar, one exit-side collar) plus the through-ring — NOT
+        from every seat being entry_seat=True. This asserts the pair covers
+        both faces; the per-seat entry/exit split is an intentional geometry
+        knob, so individual booleans are not pinned here.
+        """
+        raw = json.loads((SCAD_DIR / "motor_mount_params.json").read_text())
+        p = PipelineParams.from_dict(raw)
+        assert len(p.bolt_seats) >= 2, (
+            "motor_mount needs at least a matched pair of bolt_seats to cover "
+            "both faces"
+        )
+        assert any(bs.entry_seat for bs in p.bolt_seats), \
+            "no bolt_seat provides an entry-side collar (low-coord face)"
+        assert any(bs.exit_seat for bs in p.bolt_seats), \
+            "no bolt_seat provides an exit-side collar (high-coord face)"
 
     def test_base_part_load_defaults_to_full(self):
         """base_part.json has no `selector` on load → should default to 'full'."""
