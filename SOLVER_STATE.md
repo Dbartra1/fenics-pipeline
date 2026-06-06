@@ -407,8 +407,15 @@ pub struct SolveStats {
 ### `multigrid.rs` — VCycle Geometric Multigrid Preconditioner
 
 **Purpose**: Implements the VCycle preconditioner using geometric coarsening
-on the structured hex grid. This is the primary preconditioner for large
-CPU-path problems.
+on the structured hex grid.
+
+**STATUS — EXPERIMENTAL, NOT IN DISPATCH.** This module is not called by the
+production solver. `VCyclePreconditioner` has no call site in `vcycle_dispatch.rs`
+or `simp.rs` — only in this file and its own unit tests. It assumes power-of-2
+grid dimensions; production grids (e.g. 70×60×80) violate that and it returns a
+wrong operator (C≈1.68e3 at iter 1 vs ~0.1). The primary solver for large CPU
+problems is AMGCL (see §3). The components below are individually correct; only
+the non-power-of-2 coarsening is broken. Fix-or-retire is roadmap R6.
 
 **Key types**:
 
@@ -469,39 +476,37 @@ when `solver.rs` needs VCycle — resolved by `vcycle_dispatch.rs`.
 
 ---
 
-### `vcycle_dispatch.rs` — Dispatch Shim
+### `vcycle_dispatch.rs` — Solver Dispatch
 
-**Purpose**: Breaks the circular dependency between `multigrid.rs` and
-`solver.rs`. This module imports from both and provides the unified solve
-interface that `simp.rs` calls.
+**Purpose**: The one module that decides which linear solver runs for each
+K·u=f solve; `simp.rs` calls `solve_linear_system` here every iteration. The full
+dispatch tree and conditions are in §3. Historically this module also acted as a
+shim breaking a `multigrid.rs` ↔ `solver.rs` circular dependency (AD-02); that
+role is now vestigial — it no longer imports `multigrid.rs`, and the VCycle path
+is not dispatched.
 
-**The circular dependency problem**:
-- `multigrid.rs` imports `solver.rs` (for coarse-grid solve)
-- `solver.rs` needs to dispatch to `VCyclePreconditioner` for large problems
-- If `solver.rs` imports `multigrid.rs` directly: A imports B, B imports A → cycle
-
-**Solution**: `vcycle_dispatch.rs` imports both `solver` and `multigrid`.
-`simp.rs` imports `vcycle_dispatch`. Neither `solver` nor `multigrid` import
-each other through the dispatch path.
-
-**Current module dependency graph**:
+**Module dependency graph** (live call path):
 ```
 main.rs
  ├── simp.rs
- │    └── vcycle_dispatch.rs    ← calls both solver and multigrid
- │         ├── solver.rs        ← Cholesky, Jacobi-CG, GPU-CG
- │         └── multigrid.rs     ← VCycle-PCG
- │              └── solver.rs   ← coarse-grid direct solve (no cycle!)
+ │    └── vcycle_dispatch.rs    ← decides which solver runs
+ │         ├── amgcl_solver.rs  ← AMGCL AMG-PCG    [PRIMARY, feature "amgcl"]
+ │         ├── solver.rs        ← faer Cholesky, Jacobi-PCG (fallback + corrector)
+ │         └── gpu_solver.rs    ← GPU ILU(0)-PCG   [DEPRECATED, feature "gpu" only]
  ├── assembly.rs
  ├── sensitivity.rs
- └── oc_update.rs
+ ├── oc_update.rs
+ └── multigrid.rs               ← compiled (mod-declared) but NOT called
+                                  (experimental; see §3 and R6)
 ```
 
-**Dispatch logic** (current thresholds):
+**Dispatch logic** (summary — see §3 for the full tree):
 ```
-n_dof < 50,000            → faer Cholesky (direct, in solver.rs)
-n_dof ≥ 50,000 + use_gpu  → ILU(0)-CG via cuSPARSE (in gpu_solver.rs)
-n_dof ≥ 50,000 + cpu      → VCycle-PCG (multigrid.rs + solver.rs)
+n_dof < 50,000                            → faer Cholesky (solver.rs)
+n_dof ≥ 50,000, feature "amgcl" (default) → AMGCL AMG-PCG          [PRIMARY]
+   └─ per-iteration: rel_residual > 0.1   → Jacobi-PCG for that one iteration
+n_dof ≥ 50,000, "gpu" & not "amgcl"       → GPU ILU(0)-PCG         [DEPRECATED]
+fallback (amgcl off / gpu off)            → CPU Jacobi-PCG
 ```
 
 **Key function signature**:
@@ -510,14 +515,16 @@ pub fn solve_linear_system(
     k_rows: &[usize], k_cols: &[usize], k_vals: &[f64],
     f: &[f64], u: &mut [f64],
     tol: f64, max_iter: usize,
-    nx_nodes: usize, ny_nodes: usize, nz_nodes: usize,
+    _nx: usize, _ny: usize, _nz: usize,   // reserved for Phase 3 GMG; unused
     gpu_ctx: &mut GpuContext,
-) -> SolveStats
+) -> CgResult
 ```
 
-The `nx_nodes, ny_nodes, nz_nodes` parameters are the NODE counts (grid.nx+1,
-etc.), NOT element counts. These are needed by the VCycle to build the coarse
-grid hierarchy. Getting this wrong would build an incorrect prolongation operator.
+The `_nx, _ny, _nz` parameters (node counts) are underscore-prefixed and
+currently unused — reserved for a future V-cycle re-enable (R6). The active AMGCL
+path builds its hierarchy algebraically from the matrix and does not need them.
+`u` is warm-started on entry (carried from the previous SIMP iteration) and holds
+the solution on exit. Return type is `CgResult` (defined in solver.rs).
 
 ---
 
@@ -730,7 +737,7 @@ solver. Fix-or-retire is roadmap item R6.
 **50k DOF threshold rationale**: At 50k DOFs, faer Cholesky factorization
 takes ~500ms and the resulting direct solve is faster than 200 CG iterations.
 Above 50k, Cholesky fill-in becomes too large and CG is preferred. This
-threshold was determined empirically during Tier 4 development.
+threshold was determined empirically during solver development.
 
 **Solver context** (`GpuContext` struct in vcycle_dispatch.rs — the name is a
 misnomer kept for back-compat with simp.rs; it is the persistent *solver*
@@ -1059,6 +1066,12 @@ Neither A nor B import each other; callers import C.
 dependency in the Rust solver. Do not restructure core modules to break
 cycles; add a shim instead.
 
+**Current role**: With VCycle no longer dispatched, the shim no longer imports
+`multigrid.rs`; `vcycle_dispatch.rs` is now primarily the AMGCL / Cholesky /
+Jacobi dispatcher (§3). The shim *pattern* and the guidance above still stand for
+future cycles — the specific multigrid↔solver cycle it originally resolved is just
+no longer live.
+
 ### AD-03: mtime-Based Handoff Detection (Not Alphabetical)
 
 All `glob("*_stageXX.json")` auto-detection uses:
@@ -1159,6 +1172,12 @@ Key test modules and what they cover:
 | simp.rs       | Compliance decreasing, volume fraction tracking, warm-start     |
 | io.rs         | Checkpoint round-trip, stale n_elem rejection                  |
 | multigrid.rs  | VCycle reduces residual, symmetry, faster than Jacobi          |
+
+> **Note on multigrid.rs tests**: these pass only because they run on small,
+> power-of-2 grids. The VCycle is NOT dispatched in production and produces a
+> wrong operator on real (non-power-of-2) grids — see §3 and §2 `multigrid.rs`.
+> A green badge here is the false-confidence case flagged in R0; an integration
+> test on a non-power-of-2 grid above the 50k threshold would catch it (R2/R6).
 
 **Running specific test modules**:
 ```bash

@@ -258,7 +258,8 @@ from the global U by DOF lookup).
 ### Compliance Scaling with Problem Size
 
 Compliance scales with the physical load magnitude and domain size. For the
-motor mount example (5000N load, steel, ~96k elements at 1mm voxels):
+motor mount example (5000N load, steel, 70×60×80 = 336,000 elements / ~1.05M
+DOF at 1mm voxels):
 
     Typical converged compliance: ~0.041 J
 
@@ -359,12 +360,12 @@ Cell 3 via run_stage):
 The Stage 2 warm-start from Stage 1's density field is critical. Without it,
 Stage 2 at p=3 starting from uniform density is much slower to converge.
 
-IMPORTANT BUG — GPU warm-start: The GPU CG solver zeroes u on entry to each
-solve. On the CPU path, u is carried forward between iterations (warm-start),
-which reduces CG iterations needed. This is documented tech debt — the GPU
-path is functionally correct but uses more CG iterations in early SIMP
-iterations than necessary. Fix is to pass the previous u as initial guess
-to the GPU solver.
+NOTE — warm-start: Both the CPU path and the GPU path now carry u forward
+between iterations as the CG initial guess (the GPU warm-start was implemented;
+see SOLVER_STATE.md TD-01, RESOLVED). The production solver is AMGCL on the CPU
+(see SOLVER_STATE.md §3); the legacy GPU CG path is deprecated. Either way,
+warm-starting reduces CG iteration counts, which matters most in late SIMP
+iterations where displacements change slowly.
 
 ### ρ_min — Why Not Zero?
 
@@ -709,7 +710,10 @@ With confirmed working parameters at 1mm voxels:
     conrod    (~96k elements):  ~36 min total
     Typical iteration time: ~16s/iter on CPU CG path
 
-GPU target (when GPU warm-start bug is fixed): ~3s/iter (5× improvement).
+The current ~16 s/iter is the AMGCL OpenMP (CPU) figure and is dominated by the
+per-iteration hierarchy rebuild (SOLVER_STATE.md TD-07 / roadmap R2). A genuine
+GPU speedup requires a contrast-robust GPU preconditioner (AMGCL-CUDA, roadmap
+R4); the legacy GPU ILU(0) path is deprecated and not a route to it.
 
 The iteration time scales roughly linearly with n_elements at fixed CG
 iteration count, and the CG iteration count scales with κ(K), which
@@ -1322,24 +1326,20 @@ two runs on the same day produce files with the same date prefix — the
 wrong file gets picked up. mtime ensures the most recently written file
 is selected. This was a confirmed bug that was fixed in the Tier 5 audit.
 
-### Note 6: The GPU Warm-Start Bug (Tech Debt)
+### Note 6: GPU Warm-Start — RESOLVED
 
-The GPU CG solver (`gpu_solver.rs`) zeros `u` (displacement vector) at the
-start of each call. On the CPU path, `u` is initialized to the previous
-iteration's displacement, which typically reduces CG iterations by 20–40%
-(warm-starting is especially effective when displacements change slowly,
-which they do in late SIMP iterations).
+This was historically open tech debt (the GPU CG solver zeroed `u` on entry,
+unlike the CPU path which carries `u` forward as the CG initial guess). It is now
+implemented: `cg_solve_persistent()` in `gpu_solver.rs` uploads the caller's `u`
+as the initial guess, correct for both cold- and warm-start. See SOLVER_STATE.md
+TD-01 (RESOLVED).
 
-Impact: GPU path uses more CG iterations per solve than theoretically necessary.
-The result is CORRECT — CG with zero initialization converges to the same
-solution, just takes more iterations.
-
-Fix required: pass `u` from the previous iteration as the initial guess for
-the GPU CG solve. This requires surfacing `u` through the GPU solver API
-as an in-out parameter.
-
-This is the PRIMARY GPU performance optimization remaining after the GPU
-SpMV implementation.
+Caveat: this is moot for production. The legacy GPU ILU(0)-PCG path is deprecated
+(it diverges under SIMP contrast once the condition number grows; see
+SOLVER_STATE.md §3), and the production solver is AMGCL on the CPU. The warm-start
+plumbing carries over to a future GPU AMG backend (AMGCL-CUDA, roadmap R4). The
+real remaining GPU-relevant performance item is the AMGCL hierarchy rebuild
+(TD-07 / R2), not warm-start.
 
 ### Note 7: The Filter is Built Once, Reused Every Iteration
 
