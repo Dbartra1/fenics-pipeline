@@ -704,6 +704,28 @@ Full decision tree for `vcycle_dispatch::solve_linear_system`:
                                                   diverges @ iter 6+;
                                                   dead in default build
 ```
+**Dispatch is feature-gated, not just size-gated.** The default build
+(`cargo build --release`) compiles the `amgcl` feature, so every solve at or
+above the 50k-DOF threshold routes through AMGCL. The GPU ILU(0) leaf is
+reachable *only* under `--no-default-features --features gpu`; no default build
+ever executes it.
+
+**CPU Jacobi-PCG has two roles.** It is the bottom fallback (AMGCL not compiled,
+GPU off) *and* the per-iteration corrector: when an AMGCL solve's relative
+residual exceeds `AMGCL_FALLBACK_THRESHOLD` (= 0.1), the dispatcher substitutes
+a single Jacobi-PCG solve for that iteration. Rationale (from the code): a ~10%
+displacement error corrupts the OC sensitivities and can pull the design into a
+wrong local minimum, whereas early AMGCL iterations legitimately show residuals
+of 1–10 before ILU(0) has seen a few density fields.
+
+**VCycle geometric multigrid is NOT in this dispatch.** `VCyclePreconditioner`
+(multigrid.rs) has no call site in `solve_linear_system` or `simp.rs` — it is
+referenced only inside multigrid.rs and its own unit tests. It assumes
+power-of-2 grid dimensions; production grids (e.g. 70×60×80) violate this and it
+returns a wrong operator (C≈1.68e3 at iter 1 vs the correct ~0.1). It compiles
+and its small/power-of-2 unit tests pass, which is why CI reads green despite the
+operator being unusable on real meshes. Treat it as experimental, outside the
+solver. Fix-or-retire is roadmap item R6.
 
 **50k DOF threshold rationale**: At 50k DOFs, faer Cholesky factorization
 takes ~500ms and the resulting direct solve is faster than 200 CG iterations.
