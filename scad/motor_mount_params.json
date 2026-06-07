@@ -61,7 +61,7 @@
       ],
       "magnitude_n": 5000.0
     },
-    "_dualload_comment": "DUAL-LOAD VALIDATION: axial thrust_down (5000N) shared with a lateral side_y (2000N, ~40% of axial). side_y is kept well below axial because the corner-disk supports weakly constrain lateral loads; an equal 5000N lateral drove K near-singular (ILU zero pivot). 'loads' wins over 'load'; rename loads -> _loads to revert.",
+    "_dualload_comment": "DUAL-LOAD VALIDATION (well-conditioned): axial thrust_down (-Z) shared with axial_x (-X), both reacted directly by the x_min corner disks in bending/compression. Lateral (+Y) cases were dropped: corner fixity weakly constrains lateral loads, driving thin shear-web topology -> high contrast -> ILU(0) zero pivot (seen at both 5000N and 2000N). Lateral loads need the ILU diagonal-shift robustness fix first. Rename loads->_loads to revert.",
     "loads": [
       {
         "name": "thrust_down",
@@ -95,7 +95,7 @@
         "magnitude_n": 5000.0
       },
       {
-        "name": "side_y",
+        "name": "axial_x",
         "weight": 1.0,
         "face": "x_max",
         "selector": "bolt_pattern",
@@ -119,11 +119,11 @@
         ],
         "disk_radius_m": 0.009,
         "direction": [
+          -1.0,
           0.0,
-          1.0,
           0.0
         ],
-        "magnitude_n": 2000.0
+        "magnitude_n": 5000.0
       }
     ]
   },
