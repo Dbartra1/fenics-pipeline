@@ -27,9 +27,9 @@
 # 12. Development Environment — container, paths, build commands
 # 13. Session Startup Protocol — the correct sequence to begin a work session
 #
-# LAST UPDATED: 2026-06-04
-# CURRENT HEAD: main branch
-# TEST COUNT:   140 passing (cargo test --release)
+# LAST UPDATED: 2026-06-07
+# CURRENT HEAD: main branch (R0 docs reconciled + R1 multi-load complete)
+# TEST COUNT:   141 passing (cargo test --release)
 # SOLVER STATE: AMGCL AMG-PCG is the primary solver for n_dof ≥ 50k (smoothed
 #               aggregation + ILU(0) smoother, block_size=3, OpenMP); faer
 #               sparse Cholesky below 50k; CPU Jacobi-PCG as fallback and
@@ -1203,7 +1203,8 @@ was rotated and/or mirrored incorrectly. The current NB05 is correct.
 
 ### Rust Unit Tests (cargo test)
 
-**Count**: 140 passing
+**Count**: 141 passing  (+1 over the R0 baseline: two_identical_halfweight_loads_match_single,
+which proves k=1 weighted-sum == single-load)
 **Run**: `cargo test --release` from `solver/` directory
 **Time**: ~0.17s in release mode
 
@@ -1346,6 +1347,42 @@ iterations (density changes slowly late in the run). Instrument setup-vs-solve
 timing first; the wrapper currently records neither.
 **Effort**: ~3–6 days (roadmap R2).
 
+### TD-08: ILU(0) Zero Pivot on Ill-Conditioned / Lateral Load Cases (HIGH — R2/R4)
+
+**File**: `solver/vendor/amgcl_wrapper.cpp` (relaxation config), `solver/src/amgcl_solver.rs`
+**Issue**: AMGCL's ILU(0) smoother hits a zero pivot (`rebuild: Zero pivot in
+ILU`) on the near-singular, high-contrast K produced when a load is poorly
+constrained by the fixity. The Jacobi-PCG fallback fires but also fails to
+converge those systems (res ~1e-2), corrupting the result.
+**Confirmed reproducer**: motor_mount + a `side_y` ([0,1,0]) load case at 5000 N
+AND 2000 N → zero pivot at iter ~13–16 (Stage 1, p=2). An axial −X case is
+well-conditioned and runs clean — it is the load DIRECTION vs fixity, not the
+magnitude. See MATERIALS_SPEC FM-09.
+**Impact**: lateral / ill-conditioned load cases are currently unusable; only
+well-conditioned (axial, bending) loads solve. Multi-load is otherwise correct.
+**Fix**: small diagonal shift / regularization on the ILU(0) factorization
+(AMGCL relaxation params). **Effort**: ~1–2 days.
+
+### TD-09: NB06 Validation Is Single-Load Only (MEDIUM)
+
+**File**: `notebooks/06_part_validation.ipynb`
+**Issue**: The safety-factor calc reads a single `force_vector_N` and certifies
+SF against ONE load case. On a multi-load part it validates only the primary
+case, not the worst case across `load_cases`.
+**Impact**: SF on multi-load parts understates risk — the motor_mount dual-load
+SF (10.14) is vs the −Z thrust only, not the −X case.
+**Fix**: iterate `loading.load_cases`, compute per-case SF, report worst-case +
+a per-case table. **Effort**: ~0.5–1 day.
+
+### TD-10: NB05 / NB06 Part-Detection Mismatch (LOW)
+
+**Files**: `notebooks/05_stl_export.ipynb`, `notebooks/06_part_validation.ipynb`
+**Issue**: NB05 auto-detects the part from the most recent `*_stage04.json`;
+NB06 requires `PART_NAME_OVERRIDE` or `outputs/pipeline_state.json` and errors
+otherwise. Manual Papermill runs of NB06 fail without `-p PART_NAME_OVERRIDE`.
+**Fix**: give NB06 the same mtime-based stage-handoff auto-detection as NB05.
+**Effort**: ~1 hour.
+
 
 ---
 
@@ -1355,7 +1392,12 @@ Key commits on main (most recent first):
 
 | Commit  | Message                                              | Session            |
 |---------|------------------------------------------------------|--------------------|
-| (HEAD)  | Tier 5 Session 1: part-agnosticism audit complete    | Tier 5 Session 1   |
+| (HEAD)  | R1: SOLVER_STATE §2/§7 to multi-load shape; dual-load params | R0/R1 session  |
+| dfab2ac | No-slab codification: ring-contract tests, §11 note, ILU(0) label | R0/R1 session |
+| 3897714 | Fix test_solver_interface.py to new 'loading' JSON schema | R0/R1 session      |
+| 5e93ef7 | R1 Python: loads schema, per-case .bin writer, NB04 block | R0/R1 session      |
+| c799d84 | R0 docs reconciled to code + R1 Rust weighted-sum multi-load | R0/R1 session    |
+| 5bfec6c | Tier 5 Session 1: part-agnosticism audit complete         | Tier 5 Session 1   |
 | 5bfec6c | Tier 4 Phase 6: V-cycle dispatch wired into simp     | Tier 4 Session 5   |
 | 6854929 | Tier 4 Phase 5: V-cycle GMG preconditioner           | Tier 4 Session 5   |
 | c89f23e | Tier 4 Phase 4: Galerkin coarse operator hierarchy   | Tier 4 Session 4   |

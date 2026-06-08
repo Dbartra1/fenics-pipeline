@@ -33,9 +33,11 @@
 # 15. Known Failure Modes — what goes wrong and why
 # 16. Pipeline-Specific Implementation Notes — decisions specific to this codebase
 #
-## LAST UPDATED: 2026-06-04
+## LAST UPDATED: 2026-06-07
 # PIPELINE VERSION: Rust solver — AMGCL AMG-PCG primary (smoothed aggregation +
-#                  ILU(0) smoother, block_size=3, OpenMP), 140 tests passing.
+#                  ILU(0) smoother, block_size=3, OpenMP), 141 tests passing.
+#                  Multi-load (R1): weighted-sum compliance over shared-support
+#                  load cases; validated single (k=1) + dual (k=2) end-to-end.
 #                  Two-stage penalization (p=2→p=3) at notebook level.
 #                  VCycle preconditioner is experimental, NOT in dispatch — AMGCL
 #                  is the live path (see SOLVER_STATE.md §3).
@@ -1254,6 +1256,37 @@ the other.
 
 This pattern should be followed for any future cross-module dependencies
 in the Rust solver.
+
+### FM-09: ILU(0) Zero Pivot on Under-Constrained / Lateral Load Cases
+
+**Symptom:** AMGCL CG stops converging (residual climbing to ~1e-2, [SOLVE!]
+flag) over several iterations, then a hard failure: `amgcl_update failed:
+rebuild: Zero pivot in ILU → Jacobi-PCG fallback`, after which the solver runs
+Jacobi-PCG for the rest of the run.
+
+**Cause:** The optimizer drives the density field into a near-singular,
+high-contrast configuration ILU(0) cannot factor. This happens when a load is
+poorly constrained by the fixity — most reproducibly a LATERAL load on a part
+fixed only by small corner disks on the opposite face. The disks nominally
+constrain all six rigid-body modes, but the optimized structure carrying a
+lateral load across the span grows thin shear webs (near-mechanism, very high
+ρ-contrast), which is what breaks ILU(0).
+
+**Confirmed reproducer:** motor_mount with a `side_y` load ([0,1,0]) at BOTH
+5000 N and 2000 N → zero pivot around iter 13–16 (Stage 1, p=2). Lowering the
+magnitude delayed but did not prevent it. An axial −X case ([-1,0,0],
+compression into the corner disks) is well-conditioned and runs clean — it is
+the load DIRECTION vs fixity, not the magnitude.
+
+**Current behaviour:** the fallback gate catches the hard failure and switches
+to Jacobi-PCG — but Jacobi-PCG also cannot converge these systems (the problem
+is conditioning, not the preconditioner choice). Raising MAX_CG_ITER does NOT
+help. **Fix is tech debt TD-08** (ILU diagonal shift / regularization). Until
+then, use well-constrained load directions (axial, bending) for multi-load.
+
+**Multi-load note:** the machinery is correct — the weighted sum C = Σ wᵢ·Cᵢ and
+per-case solves work; this is a preconditioner robustness limit, not a
+multi-load bug.
 
 
 ---
